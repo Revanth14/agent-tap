@@ -15,14 +15,16 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
 
 // newTestProxy starts upstream and a proxy to it, returning both servers.
-func newTestProxy(t *testing.T, upstream http.Handler, wire io.Writer) (proxy, up *httptest.Server) {
+func newTestProxy(t *testing.T, upstream http.Handler, rec *Recorder, wire io.Writer) (proxy, up *httptest.Server) {
 	t.Helper()
 	up = httptest.NewServer(upstream)
 	t.Cleanup(up.Close)
-	p, err := NewProxy(up.URL, wire)
+	p, err := NewProxy(up.URL, rec, wire)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +56,7 @@ func TestProxyForwardsBodyAndHeadersVerbatim(t *testing.T) {
 	proxy, up := newTestProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		got <- received{r.URL.Path, r.URL.RawQuery, r.Host, r.Header.Clone(), b}
-	}), nil)
+	}), nil, nil)
 
 	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages?beta=true", bytes.NewReader(body))
 	if err != nil {
@@ -86,6 +88,15 @@ func TestProxyForwardsBodyAndHeadersVerbatim(t *testing.T) {
 }
 
 func TestProxyStreamsSSEWithoutBuffering(t *testing.T) {
+	store, err := telemetry.OpenStore("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("forwarding only", func(t *testing.T) { testStreamsWithoutBuffering(t, nil) })
+	t.Run("recording", func(t *testing.T) { testStreamsWithoutBuffering(t, NewRecorder(store, nil)) })
+}
+
+func testStreamsWithoutBuffering(t *testing.T, rec *Recorder) {
 	release := make(chan struct{})
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(release) }) })
@@ -100,7 +111,7 @@ func TestProxyStreamsSSEWithoutBuffering(t *testing.T) {
 			return
 		}
 		fmt.Fprint(w, "event: message_stop\ndata: {}\n\n")
-	}), nil)
+	}), rec, nil)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(`{}`))
@@ -144,7 +155,7 @@ func TestWireLogOmitsCredentialsAndBodies(t *testing.T) {
 		w.Header().Set("Set-Cookie", "session=SETCOOKIE-SECRET")
 		w.WriteHeader(http.StatusTooManyRequests)
 		fmt.Fprint(w, `{"error":"RESPONSE-BODY-SECRET"}`)
-	}), &wire)
+	}), nil, &wire)
 
 	body := `{"model":"claude-opus-4-5","messages":[{"role":"user","content":"REQUEST-BODY-SECRET"}]}`
 	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages", strings.NewReader(body))

@@ -22,18 +22,20 @@ import (
 // prompt-cache prefix.
 type Proxy struct {
 	rp   *httputil.ReverseProxy
-	wire *wireLog // nil when the wire log is off
+	rec  *Recorder // nil: forward without recording
+	wire *wireLog  // nil when the wire log is off
 }
 
-// NewProxy returns a proxy to upstream, e.g. https://api.anthropic.com. If
-// wireOut is non-nil, each request and response is logged to it as a JSON
-// line; see wireEntry for what is logged.
-func NewProxy(upstream string, wireOut io.Writer) (*Proxy, error) {
+// NewProxy returns a proxy to upstream, e.g. https://api.anthropic.com. If rec
+// is non-nil, POST /v1/messages traffic is recorded to it. If wireOut is
+// non-nil, each request and response is logged to it as a JSON line; see
+// wireEntry for what is logged.
+func NewProxy(upstream string, rec *Recorder, wireOut io.Writer) (*Proxy, error) {
 	target, err := url.Parse(upstream)
 	if err != nil || target.Scheme == "" || target.Host == "" {
 		return nil, fmt.Errorf("claudecode: invalid upstream URL %q", upstream)
 	}
-	p := &Proxy{}
+	p := &Proxy{rec: rec}
 	if wireOut != nil {
 		p.wire = &wireLog{w: wireOut}
 	}
@@ -49,6 +51,9 @@ func NewProxy(upstream string, wireOut io.Writer) (*Proxy, error) {
 		ModifyResponse: func(resp *http.Response) error {
 			if p.wire != nil {
 				p.wire.response(resp)
+			}
+			if t, ok := resp.Request.Context().Value(turnKey{}).(*turn); ok {
+				t.response(resp)
 			}
 			return nil
 		},
@@ -68,8 +73,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.wire != nil {
 		r = r.WithContext(context.WithValue(r.Context(), wireIDKey{}, p.wire.request(r, body)))
 	}
+	if p.rec != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/messages" {
+		r = r.WithContext(context.WithValue(r.Context(), turnKey{}, p.rec.begin(r.Header.Clone(), body)))
+	}
 	p.rp.ServeHTTP(w, r)
 }
+
+type turnKey struct{}
 
 // wireLog writes request and response metadata as JSON lines, for checking
 // what Claude Code actually sends. Header values are logged only for

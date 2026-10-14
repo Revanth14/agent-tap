@@ -1,8 +1,7 @@
 // Command atap is the agent-tap daemon and CLI.
 //
-// Milestone 2 step 1: only `atap start`, running the proxy for the wire
-// capture. It forwards every path, not just /v1/*, so the capture shows any
-// non-API paths Claude Code sends to the base URL.
+// Milestone 2: only `atap start`, running the proxy, the recorder, and the
+// state API. The store is memory-only until the retention work in Milestone 3.
 package main
 
 import (
@@ -20,6 +19,8 @@ import (
 
 	"github.com/Revanth14/agent-tap/internal/adapters/claudecode"
 	"github.com/Revanth14/agent-tap/internal/config"
+	"github.com/Revanth14/agent-tap/internal/server"
+	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
 
 const usage = "usage: atap start [--port N] [--log-wire]"
@@ -53,11 +54,18 @@ func start(args []string) error {
 		return err
 	}
 
+	store, err := telemetry.OpenStore("", 0)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	hub := telemetry.NewHub(store)
+
 	var wire io.Writer
 	if *logWire {
 		wire = os.Stderr
 	}
-	proxy, err := claudecode.NewProxy(cfg.AnthropicUpstream, wire)
+	proxy, err := claudecode.NewProxy(cfg.AnthropicUpstream, claudecode.NewRecorder(store, hub), wire)
 	if err != nil {
 		return err
 	}
@@ -67,7 +75,10 @@ func start(args []string) error {
 		return err
 	}
 	// No WriteTimeout: SSE responses stay open for the whole generation.
-	srv := &http.Server{Handler: proxy, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Handler:           server.New(ln.Addr().String(), proxy, hub),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	fmt.Fprintf(os.Stderr, "atap: proxying http://%s -> %s\n", ln.Addr(), cfg.AnthropicUpstream)
