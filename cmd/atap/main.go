@@ -77,7 +77,7 @@ func start(args []string) error {
 	}
 	// No WriteTimeout: SSE responses stay open for the whole generation.
 	srv := &http.Server{
-		Handler:           server.New(ln.Addr().String(), proxy, rec.RawHandler(), hub),
+		Handler:           server.New(ln.Addr().String(), proxy, hub, rec.Routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)

@@ -41,6 +41,7 @@ type Recorder struct {
 	store *telemetry.Store
 	hub   *telemetry.Hub // nil: record without broadcasting
 	raw   *rawBuffer
+	wire  *wireLog      // nil when the wire log is off; set by NewProxy
 	seq   atomic.Uint64 // IDs for spans with no message or request ID
 
 	mu     sync.Mutex // Guards live and everything reachable from it
@@ -54,18 +55,20 @@ type sessionState struct {
 	session       *telemetry.Session // nil for requests without a session ID
 	agents        map[string]*telemetry.AgentNode
 	tools         map[string]*toolState // By tool_use ID
+	pendingLinks  map[string]string     // Subagent ID -> Task/Agent tool_use ID, from PostToolUse before the subagent's first request
 	mainCacheRead int
 	seenMain      bool
 	writtenAt     uint64
 }
 
 type toolState struct {
-	inv        telemetry.ToolInvocation
-	prompt     string    // Full Task/Agent prompt, for subagent linking
-	linked     bool      // A subagent has been linked to this Task/Agent call
-	argsDoneAt time.Time // When the call's arguments finished streaming
-	runningAt  time.Time // When Claude Code began executing the tool
-	seen       bool      // false while only its result has arrived
+	inv         telemetry.ToolInvocation
+	prompt      string    // Full Task/Agent prompt, for subagent linking
+	linked      bool      // A subagent has been linked to this Task/Agent call
+	argsDoneAt  time.Time // When the call's arguments finished streaming
+	runningAt   time.Time // When Claude Code began executing the tool
+	hookStarted bool      // runningAt came from PreToolUse, so it is exact
+	seen        bool      // false until the parser reaches its tool_use block
 }
 
 // finished reports whether the tool's result has arrived. Parser events for
@@ -528,7 +531,10 @@ func (rec *Recorder) spanCompleted(sp *telemetry.InferenceSpan, info requestInfo
 			continue
 		}
 		if !ts.finished() {
-			ts.inv.Status, ts.runningAt, pending = "running", now, true
+			ts.inv.Status, pending = "running", true
+			if ts.runningAt.IsZero() { // PreToolUse may have set it already, exactly
+				ts.runningAt = now
+			}
 			rec.saveTool(ts)
 		}
 		sp.ToolsInvoked = append(sp.ToolsInvoked, ts.inv)
@@ -595,6 +601,10 @@ func (rec *Recorder) track(sp *telemetry.InferenceSpan, info requestInfo) (*sess
 		}
 		rec.check(rec.store.UpsertSession(*st.session))
 		rec.broadcast(telemetry.EventSessionUpdated, *st.session)
+	} else if st.session != nil && st.session.PrimarySurface == telemetry.SurfaceUnknown {
+		st.session.PrimarySurface = info.Surface // The session was created by a hook.
+		rec.check(rec.store.UpsertSession(*st.session))
+		rec.broadcast(telemetry.EventSessionUpdated, *st.session)
 	}
 	a, ok := st.agents[sp.AgentID]
 	if !ok {
@@ -608,7 +618,12 @@ func (rec *Recorder) track(sp *telemetry.InferenceSpan, info requestInfo) (*sess
 		}
 		if info.AgentRole == telemetry.RoleSubagent {
 			a.Label = truncateRunes(strings.Join(strings.Fields(info.FirstUserText), " "), labelRunes)
-			a.ParentToolID = matchTask(st, info)
+			if toolID, ok := st.pendingLinks[a.ID]; ok {
+				a.ParentToolID = toolID // From PostToolUse: authoritative.
+				delete(st.pendingLinks, a.ID)
+			} else {
+				a.ParentToolID = matchTask(st, info)
+			}
 		}
 		st.agents[a.ID] = a
 	}
@@ -667,9 +682,10 @@ func (rec *Recorder) state(sessionID string) *sessionState {
 		delete(rec.live, oldestID)
 	}
 	st := &sessionState{
-		agents:    make(map[string]*telemetry.AgentNode),
-		tools:     make(map[string]*toolState),
-		writtenAt: rec.writes,
+		agents:       make(map[string]*telemetry.AgentNode),
+		tools:        make(map[string]*toolState),
+		pendingLinks: make(map[string]string),
+		writtenAt:    rec.writes,
 	}
 	rec.live[sessionID] = st
 	return st

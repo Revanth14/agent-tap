@@ -28,7 +28,7 @@ func newTestServer(t *testing.T) (srv *httptest.Server, proxied chan string) {
 		w.Header().Set("X-Raw-Span", r.PathValue("id"))
 	})
 	srv = httptest.NewUnstartedServer(nil)
-	srv.Config.Handler = New(srv.Listener.Addr().String(), proxy, raw, telemetry.NewHub(store))
+	srv.Config.Handler = New(srv.Listener.Addr().String(), proxy, telemetry.NewHub(store), map[string]http.Handler{"GET /api/spans/{id}/raw": raw})
 	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv, proxied

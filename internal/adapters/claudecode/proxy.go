@@ -39,6 +39,9 @@ func NewProxy(upstream string, rec *Recorder, wireOut io.Writer) (*Proxy, error)
 	p := &Proxy{rec: rec}
 	if wireOut != nil {
 		p.wire = &wireLog{w: wireOut}
+		if rec != nil {
+			rec.wire = p.wire
+		}
 	}
 	p.rp = &httputil.ReverseProxy{
 		// Rewrite has already dropped hop-by-hop headers from pr.Out; every
@@ -107,13 +110,18 @@ type wireIDKey struct{}
 type wireEntry struct {
 	ID          uint64            `json:"id"` // Pairs a request with its response
 	Time        time.Time         `json:"time"`
-	Dir         string            `json:"dir"` // "request" or "response"
+	Dir         string            `json:"dir"` // "request", "response" or "hook"
 	Method      string            `json:"method,omitempty"`
 	Path        string            `json:"path"` // Without the query string
 	Status      int               `json:"status,omitempty"`
 	HeaderNames []string          `json:"header_names"`
 	Headers     map[string]string `json:"headers,omitempty"` // Allowlisted values only
 	Model       string            `json:"model,omitempty"`   // From a /v1/messages request body
+
+	// Hooks: the event and the key names of the payload, never values.
+	Event            string   `json:"event,omitempty"`
+	Keys             []string `json:"keys,omitempty"`
+	ToolResponseKeys []string `json:"tool_response_keys,omitempty"`
 }
 
 func (l *wireLog) request(r *http.Request, body []byte) uint64 {
@@ -140,6 +148,16 @@ func (l *wireLog) response(resp *http.Response) {
 	id, _ := resp.Request.Context().Value(wireIDKey{}).(uint64)
 	e := wireEntry{ID: id, Dir: "response", Path: resp.Request.URL.Path, Status: resp.StatusCode}
 	e.HeaderNames, e.Headers = describeHeaders(resp.Header)
+	l.write(e)
+}
+
+func (l *wireLog) hook(event string, body []byte) {
+	l.mu.Lock()
+	l.next++
+	id := l.next
+	l.mu.Unlock()
+	e := wireEntry{ID: id, Dir: "hook", Path: "/api/hooks/claude", Event: event}
+	e.Keys, e.ToolResponseKeys = hookKeys(body)
 	l.write(e)
 }
 
