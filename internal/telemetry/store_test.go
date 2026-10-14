@@ -20,7 +20,7 @@ func TestStoreEmptySnapshotEncodesArrays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"sessions":[],"agents":[],"spans":[],"tools":[]}`; string(data) != want {
+	if want := `{"sessions":[],"agents":[],"spans":[],"tools":[],"plan_usage":null}`; string(data) != want {
 		t.Errorf("empty snapshot = %s, want %s", data, want)
 	}
 }
@@ -128,6 +128,33 @@ func TestStoreToolNeedsKnownSpanOrAgent(t *testing.T) {
 	mustNoErr(t, s.UpsertTool(ToolInvocation{ToolUseID: "tu1", AgentID: "a1"}))
 	if got := len(s.Snapshot().Tools); got != 1 {
 		t.Errorf("tools = %d, want 1 (joined via agent)", got)
+	}
+}
+
+func TestStorePlanUsage(t *testing.T) {
+	s, err := OpenStore("", 0)
+	mustNoErr(t, err)
+	if s.Snapshot().PlanUsage != nil {
+		t.Fatal("PlanUsage before any update: want nil")
+	}
+
+	s.SetPlanUsage(PlanUsage{Provider: "claude_code", Windows: []UsageWindow{{Name: "5h", Utilization: 0.42, Status: "allowed"}}})
+	reset := time.Date(2026, 10, 14, 19, 0, 0, 0, time.UTC)
+	windows := []UsageWindow{
+		{Name: "5h", Utilization: 0.46, ResetsAt: &reset, Status: "allowed"},
+		{Name: "7d", Utilization: 0.13, Status: "allowed"},
+	}
+	s.SetPlanUsage(PlanUsage{Provider: "claude_code", Windows: windows})
+	// The store must hold its own copy of the windows and their reset times.
+	windows[0].Utilization = 0.99
+	reset = time.Time{}
+
+	got := s.Snapshot().PlanUsage
+	if got == nil || len(got.Windows) != 2 {
+		t.Fatalf("PlanUsage = %+v, want the latest two windows", got)
+	}
+	if w := got.Windows[0]; w.Utilization != 0.46 || w.ResetsAt == nil || !w.ResetsAt.Equal(time.Date(2026, 10, 14, 19, 0, 0, 0, time.UTC)) {
+		t.Errorf("5h window = %+v, want the latest value, unaffected by caller mutation", w)
 	}
 }
 

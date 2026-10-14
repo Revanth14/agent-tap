@@ -54,11 +54,12 @@ var (
 type Store struct {
 	// mu is held across the memory update and the SQLite write so the
 	// database sees upserts of the same record in the same order as memory.
-	mu       sync.RWMutex
-	db       *sql.DB // nil when persistence is disabled
-	capacity int
-	live     map[string]*liveSession // by session ID
-	writes   uint64                  // write counter, for least-recently-written eviction
+	mu        sync.RWMutex
+	db        *sql.DB // nil when persistence is disabled
+	capacity  int
+	live      map[string]*liveSession // by session ID
+	writes    uint64                  // write counter, for least-recently-written eviction
+	planUsage *PlanUsage              // latest only; never persisted
 }
 
 type liveSession struct {
@@ -170,6 +171,19 @@ func (s *Store) UpsertTool(t ToolInvocation) error {
 		t, t.ToolUseID, t.SpanID)
 }
 
+// SetPlanUsage replaces the account-level plan usage. Only the latest value is
+// kept, in memory: every response carrying usage headers refreshes it, so
+// there is nothing to persist.
+func (s *Store) SetPlanUsage(u PlanUsage) {
+	u.Windows = slices.Clone(u.Windows)
+	for i := range u.Windows {
+		u.Windows[i].ResetsAt = cloneTime(u.Windows[i].ResetsAt)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planUsage = &u
+}
+
 // toolSessionID finds the live session that already holds t, else the one
 // holding its span, else its agent's. Callers hold s.mu.
 func (s *Store) toolSessionID(t ToolInvocation) (string, bool) {
@@ -237,7 +251,8 @@ func (s *Store) persist(query string, v any, keys ...any) error {
 }
 
 // Snapshot returns the state of all live sessions, each slice ordered by
-// start time. Slices are never nil, so they encode as JSON arrays.
+// start time, plus the latest plan usage (nil until first set). Slices are
+// never nil, so they encode as JSON arrays.
 func (s *Store) Snapshot() StateSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -257,6 +272,10 @@ func (s *Store) Snapshot() StateSnapshot {
 		}
 		snap.Spans = append(snap.Spans, ls.spans.items()...)
 		snap.Tools = append(snap.Tools, ls.tools.items()...)
+	}
+	if s.planUsage != nil {
+		u := *s.planUsage
+		snap.PlanUsage = &u
 	}
 	sortByStart(snap.Sessions, func(v Session) (time.Time, string) { return v.StartedAt, v.ID })
 	sortByStart(snap.Agents, func(v AgentNode) (time.Time, string) { return v.StartedAt, v.ID })

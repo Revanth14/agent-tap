@@ -103,15 +103,31 @@ type ToolInvocation struct {
 	DurationMs int64     `json:"duration_ms,omitempty"`
 }
 
+// UsageWindow is one plan usage-limit window, e.g. Anthropic's rolling 5-hour or weekly limit.
+type UsageWindow struct {
+	Name        string     `json:"name"`        // e.g. "5h", "7d"
+	Utilization float64    `json:"utilization"` // 0-1, normalized from the provider's unit
+	ResetsAt    *time.Time `json:"resets_at,omitempty"`
+	Status      string     `json:"status"` // Provider status string, passed through
+}
+
+// PlanUsage is account-level: every session draws on the same windows.
+type PlanUsage struct {
+	Provider   string        `json:"provider"`
+	Windows    []UsageWindow `json:"windows"`
+	ObservedAt time.Time     `json:"observed_at"` // When the response carrying these values arrived
+}
+
 type StateSnapshot struct {
-	Sessions []Session        `json:"sessions"`
-	Agents   []AgentNode      `json:"agents"`
-	Spans    []InferenceSpan  `json:"spans"`
-	Tools    []ToolInvocation `json:"tools"`
+	Sessions  []Session        `json:"sessions"`
+	Agents    []AgentNode      `json:"agents"`
+	Spans     []InferenceSpan  `json:"spans"`
+	Tools     []ToolInvocation `json:"tools"`
+	PlanUsage *PlanUsage       `json:"plan_usage"` // null until the first response carrying usage headers
 }
 
 type WSEvent struct {
-	Type      string      `json:"type"` // "snapshot", "session.updated", "agent.upserted", "span.started", "span.delta", "span.completed", "tool.updated"
+	Type      string      `json:"type"` // "snapshot", "session.updated", "agent.upserted", "span.started", "span.delta", "span.completed", "tool.updated", "usage.updated"
 	Timestamp time.Time   `json:"timestamp"`
 	Payload   interface{} `json:"payload"`
 }

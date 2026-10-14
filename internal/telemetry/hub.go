@@ -21,6 +21,7 @@ const (
 	EventSpanDelta      EventType = "span.delta"
 	EventSpanCompleted  EventType = "span.completed"
 	EventToolUpdated    EventType = "tool.updated"
+	EventUsageUpdated   EventType = "usage.updated"
 )
 
 const (
