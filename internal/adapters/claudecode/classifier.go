@@ -5,8 +5,10 @@ import (
 	"cmp"
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
@@ -14,6 +16,11 @@ import (
 const (
 	previewRunes  = 300
 	context1MBeta = "context-1m-2025-08-07"
+)
+
+var (
+	ideTag  = regexp.MustCompile(`(?s)<(ide_opened_file|ide_selection|ide_diagnostics)>(.*?)</(?:ide_opened_file|ide_selection|ide_diagnostics)>`)
+	idePath = regexp.MustCompile(`/[^\s:<>"'()]+`)
 )
 
 // requestInfo is what one /v1/messages request says about who sent it and why.
@@ -30,6 +37,23 @@ type requestInfo struct {
 	ToolsOffered    []string
 	SystemPreview   string
 	LastUserPreview string
+	FirstUserText   string // Full first user message, kept for subagents only (Task linking)
+	ToolResults     []toolResult
+	IDEBlocks       []telemetry.IDEContextBlock
+}
+
+// toolResult reports a tool call's outcome, carried in the request that
+// follows it.
+type toolResult struct {
+	ToolUseID string
+	IsError   bool
+}
+
+type contentBlock struct {
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	ToolUseID string `json:"tool_use_id"`
+	IsError   bool   `json:"is_error"`
 }
 
 type messagesRequest struct {
@@ -51,11 +75,25 @@ func classify(h http.Header, body []byte) requestInfo {
 	var req messagesRequest
 	_ = json.Unmarshal(body, &req)
 	system := blockText(req.System)
-	var lastUser string
-	for i := len(req.Messages) - 1; i >= 0 && lastUser == ""; i-- {
-		if req.Messages[i].Role == "user" {
-			lastUser = blockText(req.Messages[i].Content)
+	// Claude Code also sends role "system" messages mid-conversation; they
+	// occupy context too, so they are scanned for IDE blocks.
+	userTexts := make([]string, len(req.Messages)) // Empty for non-user messages
+	contextTexts := []string{system}
+	lastAssistant := -1
+	for i, m := range req.Messages {
+		switch m.Role {
+		case "user":
+			userTexts[i] = blockText(m.Content)
+			contextTexts = append(contextTexts, userTexts[i])
+		case "system":
+			contextTexts = append(contextTexts, blockText(m.Content))
+		case "assistant":
+			lastAssistant = i
 		}
+	}
+	var lastUser string
+	for i := len(userTexts) - 1; i >= 0 && lastUser == ""; i-- {
+		lastUser = userTexts[i]
 	}
 
 	info := requestInfo{
@@ -70,6 +108,14 @@ func classify(h http.Header, body []byte) requestInfo {
 	for _, t := range req.Tools {
 		info.ToolsOffered = append(info.ToolsOffered, t.Name)
 	}
+	// New tool results are in the user messages after the last assistant
+	// message; a system message may follow them.
+	for _, m := range req.Messages[lastAssistant+1:] {
+		if m.Role == "user" {
+			info.ToolResults = append(info.ToolResults, toolResults(m.Content)...)
+		}
+	}
+	info.IDEBlocks = ideBlocks(contextTexts)
 	info.Role = requestRole(h.Get("X-Claude-Code-Request-Class"), info.ToolsOffered, system, lastUser)
 	info.Surface = surface(h.Get("User-Agent"), body)
 
@@ -79,6 +125,9 @@ func classify(h http.Header, body []byte) requestInfo {
 	if id := h.Get("X-Claude-Code-Agent-Id"); id != "" {
 		info.AgentID, info.AgentRole = id, telemetry.RoleSubagent
 		info.ParentAgentID = cmp.Or(h.Get("X-Claude-Code-Parent-Agent-Id"), mainID)
+		if len(userTexts) > 0 {
+			info.FirstUserText = userTexts[0]
+		}
 	} else {
 		info.AgentID, info.AgentRole = info.SessionID+"/"+string(info.Role), info.Role
 		if info.Role != telemetry.RoleMain {
@@ -152,10 +201,7 @@ func blockText(raw json.RawMessage) string {
 	if json.Unmarshal(raw, &s) == nil {
 		return s
 	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+	var blocks []contentBlock
 	if json.Unmarshal(raw, &blocks) != nil {
 		return ""
 	}
@@ -170,6 +216,40 @@ func blockText(raw json.RawMessage) string {
 		b.WriteString(bl.Text)
 	}
 	return b.String()
+}
+
+func toolResults(raw json.RawMessage) []toolResult {
+	var blocks []contentBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	var out []toolResult
+	for _, b := range blocks {
+		if b.Type == "tool_result" && b.ToolUseID != "" {
+			out = append(out, toolResult{ToolUseID: b.ToolUseID, IsError: b.IsError})
+		}
+	}
+	return out
+}
+
+// ideBlocks extracts the <ide_*> context blocks VS Code injects, across the
+// whole request: every one of them occupies context.
+func ideBlocks(texts []string) []telemetry.IDEContextBlock {
+	var out []telemetry.IDEContextBlock
+	for _, text := range texts {
+		for _, m := range ideTag.FindAllStringSubmatch(text, -1) {
+			inner := strings.TrimSpace(m[2])
+			n := utf8.RuneCountInString(inner)
+			out = append(out, telemetry.IDEContextBlock{
+				TagType:   m[1],
+				FilePath:  idePath.FindString(inner),
+				CharLen:   n,
+				EstTokens: n / 4,
+				Preview:   truncateRunes(inner, previewRunes),
+			})
+		}
+	}
+	return out
 }
 
 func hasBetaFlag(values []string, flag string) bool {

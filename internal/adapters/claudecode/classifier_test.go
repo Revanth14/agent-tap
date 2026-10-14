@@ -2,6 +2,7 @@ package claudecode
 
 import (
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/Revanth14/agent-tap/internal/telemetry"
@@ -135,5 +136,31 @@ func TestClassifyLongContextAndPreviews(t *testing.T) {
 	}
 	if classify(http.Header{"Anthropic-Beta": {"context-1m-2025-08-07-extra"}}, nil).LongContext {
 		t.Error("LongContext = true for a different flag sharing the prefix")
+	}
+}
+
+func TestClassifyIDEBlocksAndToolResults(t *testing.T) {
+	body := `{"model":"m","messages":[` +
+		`{"role":"user","content":[{"type":"text","text":"<ide_opened_file>The user opened the file /repo/internal/store.go in the IDE. This may or may not be related.</ide_opened_file>"},` +
+		`{"type":"text","text":"<ide_selection>The user selected the lines 3 to 5 from /repo/hub.go:\nfunc x() {}</ide_selection> explain"}]},` +
+		`{"role":"assistant","content":"ok"},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"x"},{"type":"tool_result","tool_use_id":"toolu_2","is_error":true}]}]}`
+	got := classify(http.Header{}, []byte(body))
+
+	if len(got.IDEBlocks) != 2 {
+		t.Fatalf("IDEBlocks = %+v, want 2", got.IDEBlocks)
+	}
+	if b := got.IDEBlocks[0]; b.TagType != "ide_opened_file" || b.FilePath != "/repo/internal/store.go" || b.CharLen != 92 || b.EstTokens != 23 {
+		t.Errorf("opened-file block = %+v", b)
+	}
+	if b := got.IDEBlocks[1]; b.TagType != "ide_selection" || b.FilePath != "/repo/hub.go" {
+		t.Errorf("selection block = %+v", b)
+	}
+	want := []toolResult{{ToolUseID: "toolu_1"}, {ToolUseID: "toolu_2", IsError: true}}
+	if !slices.Equal(got.ToolResults, want) {
+		t.Errorf("ToolResults = %+v, want %+v", got.ToolResults, want)
+	}
+	if got.FirstUserText != "" {
+		t.Errorf("FirstUserText = %q, want empty for a main-agent request", got.FirstUserText)
 	}
 }

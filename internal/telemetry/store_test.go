@@ -96,7 +96,7 @@ func TestStoreEvictsLeastRecentlyWrittenSession(t *testing.T) {
 	s, err := OpenStore("", 0)
 	mustNoErr(t, err)
 	sessionID := func(i int) string { return fmt.Sprintf("s%02d", i) }
-	for i := range maxLiveSessions {
+	for i := range MaxLiveSessions {
 		mustNoErr(t, s.UpsertSession(Session{ID: sessionID(i)}))
 		mustNoErr(t, s.UpsertSpan(InferenceSpan{ID: "span-" + sessionID(i), SessionID: sessionID(i)}))
 	}
@@ -106,8 +106,8 @@ func TestStoreEvictsLeastRecentlyWrittenSession(t *testing.T) {
 	snap := s.Snapshot()
 	sessions := "," + ids(snap.Sessions, func(v Session) string { return v.ID }) + ","
 	spans := "," + ids(snap.Spans, func(v InferenceSpan) string { return v.ID }) + ","
-	if len(snap.Sessions) != maxLiveSessions {
-		t.Errorf("live sessions = %d, want %d", len(snap.Sessions), maxLiveSessions)
+	if len(snap.Sessions) != MaxLiveSessions {
+		t.Errorf("live sessions = %d, want %d", len(snap.Sessions), MaxLiveSessions)
 	}
 	if strings.Contains(sessions, ",s01,") || strings.Contains(spans, ",span-s01,") {
 		t.Errorf("s01 still live: sessions %s spans %s", sessions, spans)

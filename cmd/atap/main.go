@@ -65,7 +65,8 @@ func start(args []string) error {
 	if *logWire {
 		wire = os.Stderr
 	}
-	proxy, err := claudecode.NewProxy(cfg.AnthropicUpstream, claudecode.NewRecorder(store, hub), wire)
+	rec := claudecode.NewRecorder(store, hub)
+	proxy, err := claudecode.NewProxy(cfg.AnthropicUpstream, rec, wire)
 	if err != nil {
 		return err
 	}
@@ -76,7 +77,7 @@ func start(args []string) error {
 	}
 	// No WriteTimeout: SSE responses stay open for the whole generation.
 	srv := &http.Server{
-		Handler:           server.New(ln.Addr().String(), proxy, hub),
+		Handler:           server.New(ln.Addr().String(), proxy, rec.RawHandler(), hub),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)

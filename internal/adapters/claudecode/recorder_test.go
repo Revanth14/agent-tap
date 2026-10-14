@@ -1,12 +1,15 @@
 package claudecode
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,22 +51,30 @@ const mainTurnRequest = `{"model":"claude-opus-5-5","stream":true,` +
 	`"messages":[{"role":"user","content":[{"type":"text","text":"what does store.go do?"}]}],` +
 	`"tools":[{"name":"Read"},{"name":"Agent"}]}`
 
-// recordingProxy starts an upstream serving sse, and a recording proxy to it
-// whose hub is reachable at the returned WebSocket URL.
-func recordingProxy(t *testing.T, sse string) (proxyURL, wsURL string, store *telemetry.Store) {
-	t.Helper()
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, sse)
-	}))
-	t.Cleanup(up.Close)
+// recFixture is a recording proxy in front of a test upstream, with its hub
+// served for WebSocket clients.
+type recFixture struct {
+	proxyURL, wsURL string
+	store           *telemetry.Store
+	rec             *Recorder
+}
 
+func newRecFixture(t *testing.T, upstream http.Handler) *recFixture {
+	t.Helper()
+	up := httptest.NewServer(upstream)
+	t.Cleanup(up.Close)
+	return newRecFixtureTo(t, up.URL)
+}
+
+func newRecFixtureTo(t *testing.T, upstreamURL string) *recFixture {
+	t.Helper()
 	store, err := telemetry.OpenStore("", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hub := telemetry.NewHub(store)
-	p, err := NewProxy(up.URL, NewRecorder(store, hub), nil)
+	rec := NewRecorder(store, hub)
+	p, err := NewProxy(upstreamURL, rec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +84,76 @@ func recordingProxy(t *testing.T, sse string) (proxyURL, wsURL string, store *te
 	hub.Register(mux)
 	hubSrv := httptest.NewServer(mux)
 	t.Cleanup(hubSrv.Close)
-	return proxy.URL, "ws" + strings.TrimPrefix(hubSrv.URL, "http") + "/api/ws", store
+	return &recFixture{proxy.URL, "ws" + strings.TrimPrefix(hubSrv.URL, "http") + "/api/ws", store, rec}
+}
+
+// recordingProxy starts an upstream serving sse, and a recording proxy to it
+// whose hub is reachable at the returned WebSocket URL.
+func recordingProxy(t *testing.T, sse string) (proxyURL, wsURL string, store *telemetry.Store) {
+	t.Helper()
+	f := newRecFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse)
+	}))
+	return f.proxyURL, f.wsURL, f.store
+}
+
+// scripted returns an upstream that answers successive requests with the
+// given handlers, in order.
+func scripted(t *testing.T, responses ...http.HandlerFunc) http.Handler {
+	var mu sync.Mutex
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if len(responses) == 0 {
+			mu.Unlock()
+			t.Errorf("unexpected upstream request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		next := responses[0]
+		responses = responses[1:]
+		mu.Unlock()
+		next(w, r)
+	})
+}
+
+func sseResponse(sse string, headers map[string]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse)
+	}
+}
+
+// sseTurn builds a streamed message from data payloads, one per event.
+func sseTurn(events ...string) string {
+	var b strings.Builder
+	for _, e := range events {
+		b.WriteString("data: " + e + "\n\n")
+	}
+	return b.String()
+}
+
+// post sends a /v1/messages request with Claude Code's headers and drains the
+// response, returning its status.
+func post(t *testing.T, url string, headers map[string]string, body string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+"/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
 }
 
 // waitFor polls the store until cond holds, failing after 5 seconds.
@@ -237,5 +317,310 @@ func TestRecordsStreamCutShortAsError(t *testing.T) {
 	}
 	if a := snap.Agents[0]; a.Status != "error" {
 		t.Errorf("agent status = %q, want error", a.Status)
+	}
+}
+
+var mainHeaders = map[string]string{
+	"X-Claude-Code-Session-Id":    "sess-1",
+	"X-Claude-Code-Request-Class": "main",
+	"User-Agent":                  "claude-cli/2.1.296 (external, cli)",
+}
+
+func TestRecordsPlanUsageAndHTTPErrors(t *testing.T) {
+	f := newRecFixture(t, scripted(t,
+		sseResponse(mainTurnSSE, map[string]string{
+			"Anthropic-Ratelimit-Unified-5h-Utilization": "0.42",
+			"Anthropic-Ratelimit-Unified-5h-Reset":       "1792005000",
+			"Anthropic-Ratelimit-Unified-5h-Status":      "allowed",
+			"Anthropic-Ratelimit-Unified-7d-Utilization": "0.12",
+			"Anthropic-Ratelimit-Unified-7d-Status":      "allowed",
+		}),
+		// A throttle: 429 without usage-limit headers.
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Request-Id", "req_429")
+			w.Header().Set("X-Should-Retry", "true")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error"}}`)
+		},
+	))
+	post(t, f.proxyURL, mainHeaders, mainTurnRequest)
+	if got := post(t, f.proxyURL, mainHeaders, mainTurnRequest); got != http.StatusTooManyRequests {
+		t.Fatalf("client status = %d, want the upstream 429 passed through", got)
+	}
+
+	snap := waitFor(t, f.store, func(s telemetry.StateSnapshot) bool { return len(s.Spans) == 2 && s.Spans[1].CompletedAt != nil })
+	u := snap.PlanUsage
+	if u == nil || len(u.Windows) != 2 {
+		t.Fatalf("PlanUsage = %+v, want 5h and 7d windows kept through the throttling 429", u)
+	}
+	if w := u.Windows[0]; w.Name != "5h" || w.Utilization != 0.42 || w.Status != "allowed" || w.ResetsAt == nil || !w.ResetsAt.Equal(time.Unix(1792005000, 0)) {
+		t.Errorf("5h window = %+v", w)
+	}
+	if w := u.Windows[1]; w.Name != "7d" || w.Utilization != 0.12 || w.ResetsAt != nil {
+		t.Errorf("7d window = %+v", w)
+	}
+
+	errSpan := snap.Spans[1]
+	if errSpan.ID != "req_429" || errSpan.Status != "error" || errSpan.StopReason != "http_429" || errSpan.AgentID != "sess-1/main" {
+		t.Errorf("error span = %+v", errSpan)
+	}
+	// The raw payload is filed once the response has been read to the end,
+	// just after the span is recorded.
+	var rr *httptest.ResponseRecorder
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		rr = httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/spans/req_429/raw", nil)
+		req.SetPathValue("id", "req_429")
+		f.rec.RawHandler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var raw struct{ Request, Response string }
+	if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &raw) != nil ||
+		raw.Request != mainTurnRequest || !strings.Contains(raw.Response, "rate_limit_error") {
+		t.Errorf("raw payload = %d %s", rr.Code, rr.Body)
+	}
+}
+
+func TestRecordsUnreachableUpstream(t *testing.T) {
+	down := httptest.NewServer(http.NotFoundHandler())
+	url := down.URL
+	down.Close()
+	f := newRecFixtureTo(t, url)
+	if got := post(t, f.proxyURL, mainHeaders, mainTurnRequest); got != http.StatusBadGateway {
+		t.Errorf("client status = %d, want 502", got)
+	}
+	snap := waitFor(t, f.store, func(s telemetry.StateSnapshot) bool { return len(s.Spans) == 1 })
+	if sp := snap.Spans[0]; sp.Status != "error" || sp.StopReason != "upstream_unreachable" {
+		t.Errorf("span = %+v, want an upstream_unreachable error", sp)
+	}
+}
+
+func TestRecordsClientCancelMidStream(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	f := newRecFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, mainTurnSSE[:strings.Index(mainTurnSSE, "event: content_block_delta")])
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, f.proxyURL+"/v1/messages", strings.NewReader(mainTurnRequest))
+	for k, v := range mainHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, f.store, func(s telemetry.StateSnapshot) bool { return len(s.Spans) == 1 })
+	cancel() // Esc in Claude Code
+	resp.Body.Close()
+
+	snap := waitFor(t, f.store, func(s telemetry.StateSnapshot) bool { return len(s.Spans) == 1 && s.Spans[0].CompletedAt != nil })
+	if sp := snap.Spans[0]; sp.Status != "error" || sp.StopReason != "client_canceled" {
+		t.Errorf("span = %+v, want a client_canceled error", sp)
+	}
+}
+
+// TestRecordsToolsAndAsyncSubagent follows the order real traffic showed:
+// the Agent call returns at once ("Async agent launched"), the main agent's
+// next request carries the results followed by a role "system" message, and
+// only then does the subagent send its first request.
+func TestRecordsToolsAndAsyncSubagent(t *testing.T) {
+	const taskPrompt = "Find where the ring buffer is"
+	mainWithTools := sseTurn(
+		`{"type":"message_start","message":{"id":"msg_main1","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":5000}}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{}}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"Find ring\","}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"prompt\":\"`+taskPrompt+`\",\"subagent_type\":\"Explore\"}"}}`,
+		`{"type":"content_block_stop","index":0}`,
+		`{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_read","name":"Read","input":{}}}`,
+		`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/repo/store.go\"}"}}`,
+		`{"type":"content_block_stop","index":1}`,
+		`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":50}}`,
+		`{"type":"message_stop"}`,
+	)
+	textTurn := func(id string) string {
+		return sseTurn(
+			`{"type":"message_start","message":{"id":"`+id+`","model":"claude-opus-5-5","usage":{"input_tokens":10}}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`,
+			`{"type":"message_stop"}`,
+		)
+	}
+	f := newRecFixture(t, scripted(t,
+		sseResponse(mainWithTools, nil),
+		sseResponse(textTurn("msg_main2"), nil),
+		sseResponse(textTurn("msg_sub1"), nil),
+	))
+
+	post(t, f.proxyURL, mainHeaders, mainTurnRequest)
+	snap := waitFor(t, f.store, func(s telemetry.StateSnapshot) bool {
+		return len(s.Tools) == 2 && s.Tools[0].Status == "running" && s.Tools[1].Status == "running"
+	})
+	tools := map[string]telemetry.ToolInvocation{}
+	for _, tl := range snap.Tools {
+		tools[tl.ToolUseID] = tl
+	}
+	if tl := tools["toolu_agent"]; tl.ToolName != "Agent" || tl.Target != "Find ring" || tl.SpanID != "msg_main1" || tl.AgentID != "sess-1/main" {
+		t.Errorf("Agent tool = %+v", tl)
+	}
+	if tl := tools["toolu_read"]; tl.Target != "/repo/store.go" {
+		t.Errorf("Read tool = %+v", tl)
+	}
+	if a := snap.Agents[0]; a.Status != "running_tool" || a.ActiveTool != "Read: /repo/store.go" {
+		t.Errorf("main agent = %+v, want running_tool on the last tool", a)
+	}
+	if sp := snap.Spans[0]; len(sp.ToolsInvoked) != 2 {
+		t.Errorf("span ToolsInvoked = %+v, want both tools", sp.ToolsInvoked)
+	}
+
+	post(t, f.proxyURL, mainHeaders, `{"model":"claude-opus-5-5","messages":[`+
+		`{"role":"user","content":"hi"},`+
+		`{"role":"system","content":"context"},`+
+		`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{}},{"type":"tool_use","id":"toolu_read","name":"Read","input":{}}]},`+
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent","content":"Async agent launched successfully."},`+
+		`{"type":"tool_result","tool_use_id":"toolu_read","is_error":true,"content":"denied"}]},`+
+		`{"role":"system","content":[{"type":"text","text":"reminder"}]}],"tools":[{"name":"Agent"}]}`)
+	snap = waitFor(t, f.store, func(s telemetry.StateSnapshot) bool { return len(s.Spans) == 2 && s.Spans[1].CompletedAt != nil })
+	tools = map[string]telemetry.ToolInvocation{}
+	for _, tl := range snap.Tools {
+		tools[tl.ToolUseID] = tl
+	}
+	if tools["toolu_agent"].Status != "completed" || tools["toolu_read"].Status != "failed" || tools["toolu_agent"].DurationMs < 0 {
+		t.Errorf("tools after results behind a trailing system message = %+v", tools)
+	}
+	if a := snap.Agents[0]; a.Status != "idle" || a.ActiveTool != "" {
+		t.Errorf("main agent = %+v, want idle with no active tool", a)
+	}
+
+	post(t, f.proxyURL, map[string]string{
+		"X-Claude-Code-Session-Id":    "sess-1",
+		"X-Claude-Code-Request-Class": "subagent",
+		"X-Claude-Code-Agent-Id":      "a1",
+		"X-Claude-Code-Agent-Type":    "Explore",
+	}, `{"model":"claude-opus-5-5","messages":[{"role":"user","content":"`+taskPrompt+`\n\nReport file paths."}],"tools":[{"name":"Read"}]}`)
+	snap = waitFor(t, f.store, func(s telemetry.StateSnapshot) bool {
+		return len(s.Agents) == 2 && len(s.Spans) == 3 && s.Spans[2].CompletedAt != nil
+	})
+	var sub telemetry.AgentNode
+	for _, a := range snap.Agents {
+		if a.ID == "a1" {
+			sub = a
+		}
+	}
+	if sub.ParentToolID != "toolu_agent" || sub.ParentAgentID != "sess-1/main" || sub.SubagentType != "Explore" ||
+		sub.Label != taskPrompt+" Report file paths." {
+		t.Errorf("subagent = %+v, want linked to the already-returned Agent call and labelled with its task", sub)
+	}
+	if sub.Status != "idle" || sub.CompletedAt != nil {
+		t.Errorf("subagent = %+v, want idle: the launch acknowledgment does not mean it finished", sub)
+	}
+}
+
+// TestLateParserEventsDoNotRegressTools covers Claude Code sending its next
+// request before the parser has handled the previous response's events.
+func TestLateParserEventsDoNotRegressTools(t *testing.T) {
+	store, err := telemetry.OpenStore("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := NewRecorder(store, nil)
+	info := requestInfo{SessionID: "s", AgentID: "s/main", AgentRole: telemetry.RoleMain, Role: telemetry.RoleMain}
+	sp := &telemetry.InferenceSpan{ID: "m1", SessionID: "s", AgentID: "s/main", Role: telemetry.RoleMain}
+	rec.spanStarted(sp, info)
+	rec.toolStarted(sp, info, "t1", "Read")
+	rec.toolArgsDone(sp, info, "t1", "/a.go", "")
+
+	next := requestInfo{SessionID: "s", AgentID: "s/main", ToolResults: []toolResult{{ToolUseID: "t1"}, {ToolUseID: "t2"}}}
+	rec.requestArrived(next, time.Now()) // t2's own events have not been parsed yet
+
+	rec.toolStarted(sp, info, "t2", "Grep")
+	rec.toolArgsDone(sp, info, "t2", "ring", "")
+	rec.spanCompleted(sp, info, []string{"t1", "t2"})
+
+	snap := store.Snapshot()
+	for _, tl := range snap.Tools {
+		if tl.Status != "completed" {
+			t.Errorf("tool %s = %q, want completed: a late event moved it back", tl.ToolUseID, tl.Status)
+		}
+	}
+	if len(snap.Tools) != 2 || snap.Tools[1].ToolName == "" && snap.Tools[0].ToolName == "" {
+		t.Errorf("tools = %+v, want both, with names", snap.Tools)
+	}
+	if a := snap.Agents[0]; a.Status != "idle" || a.ActiveTool != "" {
+		t.Errorf("agent = %+v, want idle with no active tool", a)
+	}
+}
+
+func TestRecordsNonStreamingResponse(t *testing.T) {
+	f := newRecFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"msg_json","type":"message","model":"claude-haiku-5-5","stop_reason":"tool_use",`+
+			`"content":[{"type":"text","text":"Checking."},{"type":"tool_use","id":"toolu_g","name":"Grep","input":{"pattern":"ring"}}],`+
+			`"usage":{"input_tokens":30,"cache_read_input_tokens":70,"output_tokens":12}}`)
+	}))
+	post(t, f.proxyURL, mainHeaders, mainTurnRequest)
+	snap := waitFor(t, f.store, func(s telemetry.StateSnapshot) bool { return len(s.Spans) == 1 && s.Spans[0].CompletedAt != nil })
+	sp := snap.Spans[0]
+	if sp.ID != "msg_json" || sp.Status != "completed" || sp.Model != "claude-haiku-5-5" || sp.OutputTokens != 12 ||
+		sp.InputTokensCacheRead != 70 || sp.StopReason != "tool_use" || sp.AssistantOutputPreview != "Checking." {
+		t.Errorf("span = %+v", sp)
+	}
+	if len(snap.Tools) != 1 || snap.Tools[0].Target != "ring" || snap.Tools[0].Status != "running" {
+		t.Errorf("tools = %+v", snap.Tools)
+	}
+}
+
+func TestRawBufferKeepsNewestWithinBudget(t *testing.T) {
+	b := newRawBuffer(100)
+	for _, id := range []string{"a", "b", "c"} {
+		b.put(id, &rawPayload{Request: make([]byte, 30), Response: make([]byte, 10)})
+	}
+	if _, ok := b.get("a"); ok {
+		t.Error("a still kept; want the oldest dropped once 120 bytes exceed the 100-byte budget")
+	}
+	for _, id := range []string{"b", "c"} {
+		if _, ok := b.get(id); !ok {
+			t.Errorf("%s dropped; want the newest kept", id)
+		}
+	}
+
+	resp := &cappedBuffer{limit: rawPayloadMax}
+	resp.Write(make([]byte, rawPayloadMax+1))
+	p := newRawPayload(make([]byte, rawPayloadMax+1), resp)
+	if !p.RequestTooLarge || !p.ResponseTooLarge || p.size() != 0 {
+		t.Errorf("oversized payload = %d bytes, flags %v %v; want nothing kept and both flagged", p.size(), p.RequestTooLarge, p.ResponseTooLarge)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/spans/gone/raw", nil)
+	req.SetPathValue("id", "gone")
+	NewRecorder(nil, nil).RawHandler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("unknown span: status %d, want 404", rr.Code)
+	}
+}
+
+func TestRecorderStateIsBounded(t *testing.T) {
+	rec := NewRecorder(nil, nil)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for i := range telemetry.MaxLiveSessions + 5 {
+		rec.state(fmt.Sprintf("s%d", i))
+	}
+	if len(rec.live) != telemetry.MaxLiveSessions {
+		t.Errorf("live sessions = %d, want %d", len(rec.live), telemetry.MaxLiveSessions)
+	}
+	if _, ok := rec.live["s0"]; ok {
+		t.Error("s0 kept; want the least recently written session dropped")
 	}
 }

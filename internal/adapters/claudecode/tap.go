@@ -1,6 +1,8 @@
 package claudecode
 
 import (
+	"context"
+	"errors"
 	"io"
 	"sync"
 )
@@ -12,8 +14,9 @@ type streamTap struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
 	buf     []byte
-	closed  bool // No more writes are coming
-	stopped bool // The reader is gone; writes are dropped
+	closed  bool  // No more writes are coming
+	stopped bool  // The reader is gone; writes are dropped
+	err     error // Why the upstream body ended: io.EOF when it completed
 }
 
 func newStreamTap() *streamTap {
@@ -31,11 +34,21 @@ func (t *streamTap) write(p []byte) {
 	}
 }
 
-func (t *streamTap) close() {
+// close records why the body ended; the first reason wins.
+func (t *streamTap) close(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.closed = true
+	if !t.closed {
+		t.closed, t.err = true, err
+	}
 	t.cond.Signal()
+}
+
+// canceled reports whether the client went away before the body completed.
+func (t *streamTap) canceled() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err == context.Canceled
 }
 
 // stop tells writers the reader is gone, releasing buffered bytes.
@@ -73,12 +86,18 @@ func (b *teeBody) Read(p []byte) (int, error) {
 		b.tap.write(p[:n])
 	}
 	if err != nil {
-		b.tap.close()
+		cause := err
+		if errors.Is(err, context.Canceled) {
+			cause = context.Canceled
+		}
+		b.tap.close(cause)
 	}
 	return n, err
 }
 
+// Close before the body ended means the proxy stopped copying it: the client
+// went away.
 func (b *teeBody) Close() error {
-	b.tap.close()
+	b.tap.close(context.Canceled)
 	return b.ReadCloser.Close()
 }

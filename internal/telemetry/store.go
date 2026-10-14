@@ -19,10 +19,10 @@ import (
 // invocations, the store keeps in memory per session.
 const DefaultRingCapacity = 1000
 
-// maxLiveSessions bounds how many sessions the store keeps in memory. A new
+// MaxLiveSessions bounds how many sessions the store keeps in memory. A new
 // session beyond it evicts the least recently written session, with its
 // agents, spans and tools, from memory; SQLite keeps them.
-const maxLiveSessions = 16
+const MaxLiveSessions = 16
 
 // Rows hold the full record as JSON so the schema can evolve without
 // migrations; the extra columns exist for ad-hoc querying.
@@ -214,7 +214,7 @@ func (s *Store) liveSession(sessionID string) *liveSession {
 		ls.writtenAt = s.writes
 		return ls
 	}
-	if len(s.live) >= maxLiveSessions {
+	if len(s.live) >= MaxLiveSessions {
 		var oldestID string
 		var oldest *liveSession
 		for id, ls := range s.live {

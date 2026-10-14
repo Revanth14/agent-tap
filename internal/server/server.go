@@ -10,12 +10,14 @@ import (
 )
 
 // New returns the daemon handler for a listener on addr (host:port). The
-// daemon's own exact routes are served locally; every other path goes to
-// proxy, because Claude Code sends non-/v1 paths such as HEAD /api/hello to
-// the base URL. Everything sits behind the Host check.
-func New(addr string, proxy http.Handler, hub *telemetry.Hub) http.Handler {
+// daemon's own exact routes are served locally, with raw serving
+// GET /api/spans/{id}/raw; every other path goes to proxy, because Claude Code
+// sends non-/v1 paths such as HEAD /api/hello to the base URL. Everything sits
+// behind the Host check.
+func New(addr string, proxy, raw http.Handler, hub *telemetry.Hub) http.Handler {
 	mux := http.NewServeMux()
 	hub.Register(mux)
+	mux.Handle("GET /api/spans/{id}/raw", raw)
 	mux.Handle("/", proxy)
 	return hostGuard(addr, mux)
 }

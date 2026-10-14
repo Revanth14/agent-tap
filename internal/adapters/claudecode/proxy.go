@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -52,10 +53,20 @@ func NewProxy(upstream string, rec *Recorder, wireOut io.Writer) (*Proxy, error)
 			if p.wire != nil {
 				p.wire.response(resp)
 			}
+			if p.rec != nil {
+				p.rec.ObserveUsage(resp.Header)
+			}
 			if t, ok := resp.Request.Context().Value(turnKey{}).(*turn); ok {
 				t.response(resp)
 			}
 			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if t, ok := r.Context().Value(turnKey{}).(*turn); ok {
+				t.unreachable(err)
+			}
+			log.Printf("atap: proxy error: %v", err)
+			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
 	return p, nil

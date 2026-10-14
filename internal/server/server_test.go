@@ -24,8 +24,11 @@ func newTestServer(t *testing.T) (srv *httptest.Server, proxied chan string) {
 	proxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxied <- r.Method + " " + r.URL.Path
 	})
+	raw := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Raw-Span", r.PathValue("id"))
+	})
 	srv = httptest.NewUnstartedServer(nil)
-	srv.Config.Handler = New(srv.Listener.Addr().String(), proxy, telemetry.NewHub(store))
+	srv.Config.Handler = New(srv.Listener.Addr().String(), proxy, raw, telemetry.NewHub(store))
 	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv, proxied
@@ -55,6 +58,10 @@ func TestRoutesDaemonPathsLocallyAndTheRestToProxy(t *testing.T) {
 	var snap telemetry.StateSnapshot
 	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&snap) != nil {
 		t.Errorf("GET /api/state = %d, want a snapshot served locally", resp.StatusCode)
+	}
+
+	if got := do(t, http.MethodGet, srv.URL+"/api/spans/msg_01/raw", "").Header.Get("X-Raw-Span"); got != "msg_01" {
+		t.Errorf("GET /api/spans/msg_01/raw reached the raw handler with id %q, want msg_01", got)
 	}
 
 	for _, req := range []string{"HEAD /api/hello", "POST /v1/messages"} {
