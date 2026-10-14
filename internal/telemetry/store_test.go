@@ -208,3 +208,51 @@ func ids[T any](vs []T, key func(T) string) string {
 	}
 	return strings.Join(parts, ",")
 }
+
+func TestStorePruneDeletesOldRowsFromEveryTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := OpenStore(path, 0)
+	mustNoErr(t, err)
+	now := time.Now()
+	for _, r := range []struct {
+		prefix  string
+		started time.Time
+	}{{"old", now.Add(-31 * 24 * time.Hour)}, {"new", now.Add(-29 * 24 * time.Hour)}} {
+		sess := r.prefix + "-s"
+		mustNoErr(t, s.UpsertSession(Session{ID: sess, StartedAt: r.started}))
+		mustNoErr(t, s.UpsertAgent(AgentNode{ID: r.prefix + "-a", SessionID: sess, StartedAt: r.started}))
+		mustNoErr(t, s.UpsertSpan(InferenceSpan{ID: r.prefix + "-sp", SessionID: sess, AgentID: r.prefix + "-a", StartedAt: r.started}))
+		mustNoErr(t, s.UpsertTool(ToolInvocation{ToolUseID: r.prefix + "-t", SpanID: r.prefix + "-sp", StartedAt: r.started}))
+	}
+
+	n, err := s.Prune(now.Add(-30 * 24 * time.Hour))
+	mustNoErr(t, err)
+	if n != 4 {
+		t.Errorf("pruned %d rows, want 4 (one per table)", n)
+	}
+	mustNoErr(t, s.Close())
+
+	db, err := sql.Open("sqlite", path)
+	mustNoErr(t, err)
+	defer db.Close()
+	for table, idCol := range map[string]string{"sessions": "id", "agents": "id", "spans": "id", "tools": "tool_use_id"} {
+		var ids []string
+		rows, err := db.Query(`SELECT ` + idCol + ` FROM ` + table)
+		mustNoErr(t, err)
+		for rows.Next() {
+			var id string
+			mustNoErr(t, rows.Scan(&id))
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if len(ids) != 1 || !strings.HasPrefix(ids[0], "new-") {
+			t.Errorf("%s after prune = %v, want only the row from 29 days ago", table, ids)
+		}
+	}
+
+	mem, err := OpenStore("", 0)
+	mustNoErr(t, err)
+	if n, err := mem.Prune(now); n != 0 || err != nil {
+		t.Errorf("memory-only Prune = %d, %v; want 0, nil", n, err)
+	}
+}

@@ -25,13 +25,16 @@ const DefaultRingCapacity = 1000
 const MaxLiveSessions = 16
 
 // Rows hold the full record as JSON so the schema can evolve without
-// migrations; the extra columns exist for ad-hoc querying.
+// migrations; the extra columns exist for ad-hoc querying, and started_at
+// (Unix milliseconds) for retention.
 const schemaDDL = `
-CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS spans (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, data TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS tools (tool_use_id TEXT PRIMARY KEY, span_id TEXT NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS spans (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tools (tool_use_id TEXT PRIMARY KEY, span_id TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
 `
+
+var retainedTables = []string{"sessions", "agents", "spans", "tools"}
 
 var (
 	errEmptyID       = errors.New("telemetry: empty id")
@@ -100,6 +103,27 @@ func OpenStore(path string, capacity int) (*Store, error) {
 	return s, nil
 }
 
+// Prune deletes persisted rows that started before cutoff, in every table,
+// and returns how many it deleted. It leaves memory alone: the live rings
+// hold only recent records anyway.
+func (s *Store) Prune(cutoff time.Time) (int64, error) {
+	if s.db == nil {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total int64
+	for _, table := range retainedTables {
+		res, err := s.db.Exec(`DELETE FROM `+table+` WHERE started_at < ?`, cutoff.UnixMilli())
+		if err != nil {
+			return total, fmt.Errorf("telemetry: prune %s: %w", table, err)
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
 // Close closes the database, if any.
 func (s *Store) Close() error {
 	if s.db == nil {
@@ -116,8 +140,9 @@ func (s *Store) UpsertSession(sess Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.liveSession(sess.ID).session = &sess
-	return s.persist(`INSERT INTO sessions (data, id) VALUES (?, ?)
-		ON CONFLICT(id) DO UPDATE SET data = excluded.data`, sess, sess.ID)
+	return s.persist(`INSERT INTO sessions (data, id, started_at) VALUES (?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET started_at = excluded.started_at, data = excluded.data`,
+		sess, sess.ID, sess.StartedAt.UnixMilli())
 }
 
 // UpsertAgent inserts or replaces an agent.
@@ -129,9 +154,9 @@ func (s *Store) UpsertAgent(a AgentNode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.liveSession(a.SessionID).agents[a.ID] = a
-	return s.persist(`INSERT INTO agents (data, id, session_id) VALUES (?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, data = excluded.data`,
-		a, a.ID, a.SessionID)
+	return s.persist(`INSERT INTO agents (data, id, session_id, started_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, started_at = excluded.started_at, data = excluded.data`,
+		a, a.ID, a.SessionID, a.StartedAt.UnixMilli())
 }
 
 // UpsertSpan inserts or replaces a span, evicting its session's oldest span
@@ -148,9 +173,9 @@ func (s *Store) UpsertSpan(sp InferenceSpan) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.liveSession(sp.SessionID).spans.put(sp.ID, sp)
-	return s.persist(`INSERT INTO spans (data, id, session_id, agent_id) VALUES (?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id, data = excluded.data`,
-		sp, sp.ID, sp.SessionID, sp.AgentID)
+	return s.persist(`INSERT INTO spans (data, id, session_id, agent_id, started_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id, started_at = excluded.started_at, data = excluded.data`,
+		sp, sp.ID, sp.SessionID, sp.AgentID, sp.StartedAt.UnixMilli())
 }
 
 // UpsertTool inserts or replaces a tool invocation in the session of its span
@@ -166,9 +191,9 @@ func (s *Store) UpsertTool(t ToolInvocation) error {
 		return fmt.Errorf("%w: tool %s, span %q, agent %q", errToolNoSession, t.ToolUseID, t.SpanID, t.AgentID)
 	}
 	s.liveSession(sessionID).tools.put(t.ToolUseID, t)
-	return s.persist(`INSERT INTO tools (data, tool_use_id, span_id) VALUES (?, ?, ?)
-		ON CONFLICT(tool_use_id) DO UPDATE SET span_id = excluded.span_id, data = excluded.data`,
-		t, t.ToolUseID, t.SpanID)
+	return s.persist(`INSERT INTO tools (data, tool_use_id, span_id, started_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(tool_use_id) DO UPDATE SET span_id = excluded.span_id, started_at = excluded.started_at, data = excluded.data`,
+		t, t.ToolUseID, t.SpanID, t.StartedAt.UnixMilli())
 }
 
 // SetPlanUsage replaces the account-level plan usage. Only the latest value is

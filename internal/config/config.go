@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 const (
@@ -18,14 +19,19 @@ const (
 
 	// DefaultAnthropicUpstream is where the /v1/messages proxy forwards requests.
 	DefaultAnthropicUpstream = "https://api.anthropic.com"
+
+	// DefaultRetention is how long persisted telemetry is kept. It holds
+	// prompt previews and tool targets, so it is not kept indefinitely.
+	DefaultRetention = 30 * 24 * time.Hour
 )
 
 // Config is the daemon configuration.
 type Config struct {
-	Host              string // Listen host for proxy, REST API, hooks, WebSocket and UI
-	Port              int    // Listen port
-	AnthropicUpstream string // Upstream base URL for the Claude Code adapter
-	DBPath            string // SQLite database file
+	Host              string        // Listen host for proxy, REST API, hooks, WebSocket and UI
+	Port              int           // Listen port
+	AnthropicUpstream string        // Upstream base URL for the Claude Code adapter
+	DBPath            string        // SQLite database file
+	Retention         time.Duration // Rows older than this are deleted at startup
 }
 
 // Default returns the default configuration, with the database at
@@ -40,6 +46,7 @@ func Default() (Config, error) {
 		Port:              DefaultPort,
 		AnthropicUpstream: DefaultAnthropicUpstream,
 		DBPath:            filepath.Join(home, ".agent-tap", "state.db"),
+		Retention:         DefaultRetention,
 	}, nil
 }
 

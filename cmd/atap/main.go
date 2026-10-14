@@ -1,7 +1,7 @@
 // Command atap is the agent-tap daemon and CLI.
 //
-// Milestone 2: only `atap start`, running the proxy, the recorder, and the
-// state API. The store is memory-only until the retention work in Milestone 3.
+// Milestone 3 in progress: only `atap start`, running the proxy, the
+// recorder, hooks, and the state API, persisting to SQLite.
 package main
 
 import (
@@ -54,11 +54,16 @@ func start(args []string) error {
 		return err
 	}
 
-	store, err := telemetry.OpenStore("", 0)
+	store, err := telemetry.OpenStore(cfg.DBPath, 0)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	pruned, err := store.Prune(time.Now().Add(-cfg.Retention))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "atap: %s (pruned %d rows older than %d days)\n", cfg.DBPath, pruned, int(cfg.Retention.Hours()/24))
 	hub := telemetry.NewHub(store)
 
 	var wire io.Writer
