@@ -470,7 +470,12 @@ func (rec *Recorder) spanStarted(sp *telemetry.InferenceSpan, info requestInfo) 
 			sp.InputTokensUncached+sp.InputTokensCacheWrite > 10_000
 		st.mainCacheRead, st.seenMain = sp.InputTokensCacheRead, true
 	}
-	agent.Status = "streaming"
+	if agent.CompletedAt != nil && sp.StartedAt.After(*agent.CompletedAt) {
+		agent.CompletedAt = nil // Resumed: Claude Code can continue a finished subagent.
+	}
+	if !settled(agent, sp) {
+		agent.Status = "streaming"
+	}
 	rec.check(rec.store.UpsertSpan(*sp))
 	rec.saveAgent(agent)
 	rec.broadcast(telemetry.EventSpanStarted, *sp)
@@ -493,7 +498,7 @@ func (rec *Recorder) toolStarted(sp *telemetry.InferenceSpan, info requestInfo, 
 	ts.seen = true
 	ts.inv.SpanID, ts.inv.AgentID, ts.inv.ToolName, ts.inv.StartedAt = sp.ID, sp.AgentID, name, time.Now()
 	rec.saveTool(ts)
-	if !ts.finished() {
+	if !ts.finished() && !settled(agent, sp) {
 		agent.ActiveTool = name
 		rec.saveAgent(agent)
 	}
@@ -509,7 +514,7 @@ func (rec *Recorder) toolArgsDone(sp *telemetry.InferenceSpan, info requestInfo,
 	}
 	ts.inv.Target, ts.prompt, ts.argsDoneAt = target, prompt, time.Now()
 	rec.saveTool(ts)
-	if !ts.finished() {
+	if !ts.finished() && !settled(agent, sp) {
 		agent.ActiveTool = ts.inv.ToolName
 		if target != "" {
 			agent.ActiveTool += ": " + target
@@ -540,11 +545,13 @@ func (rec *Recorder) spanCompleted(sp *telemetry.InferenceSpan, info requestInfo
 		sp.ToolsInvoked = append(sp.ToolsInvoked, ts.inv)
 	}
 	agent.TotalTokens += inputTokens(sp) + sp.OutputTokens
-	agent.Status = "idle"
-	if pending {
+	switch {
+	case settled(agent, sp):
+		// SubagentStop arrived before this span's last events were parsed.
+	case pending:
 		agent.Status = "running_tool"
-	} else {
-		agent.ActiveTool = ""
+	default:
+		agent.Status, agent.ActiveTool = "idle", ""
 	}
 	rec.check(rec.store.UpsertSpan(*sp))
 	rec.broadcast(telemetry.EventSpanCompleted, *sp)
@@ -573,7 +580,9 @@ func (rec *Recorder) spanFailed(sp *telemetry.InferenceSpan, info requestInfo, t
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	st, agent := rec.track(sp, info)
-	agent.Status = "error"
+	if !settled(agent, sp) {
+		agent.Status = "error"
+	}
 	rec.check(rec.store.UpsertSpan(*sp))
 	rec.broadcast(telemetry.EventSpanCompleted, *sp)
 	for _, id := range toolIDs {
@@ -633,6 +642,12 @@ func (rec *Recorder) track(sp *telemetry.InferenceSpan, info requestInfo) (*sess
 		a.Model = sp.Model
 	}
 	return st, a
+}
+
+// settled reports whether the agent completed (SubagentStop) after sp
+// started: events for such a span are late and must not reopen the agent.
+func settled(a *telemetry.AgentNode, sp *telemetry.InferenceSpan) bool {
+	return a.CompletedAt != nil && !sp.StartedAt.After(*a.CompletedAt)
 }
 
 // matchTask finds the parent's not-yet-linked Task/Agent call whose prompt

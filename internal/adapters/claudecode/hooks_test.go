@@ -163,6 +163,44 @@ func TestHooksLinkAndCompleteSubagents(t *testing.T) {
 	}
 }
 
+// TestSubagentStopIsNotUndoneByLateEvents covers SubagentStop arriving before
+// the parser has handled the subagent's last message_stop, and a later
+// resume of the same subagent.
+func TestSubagentStopIsNotUndoneByLateEvents(t *testing.T) {
+	store, err := telemetry.OpenStore("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := NewRecorder(store, nil)
+	info := requestInfo{SessionID: "s", AgentID: "a1", ParentAgentID: "s/main", AgentRole: telemetry.RoleSubagent, Role: telemetry.RoleSubagent}
+	last := &telemetry.InferenceSpan{ID: "sub-last", SessionID: "s", AgentID: "a1", Role: telemetry.RoleSubagent, StartedAt: time.Now()}
+	rec.spanStarted(last, info)
+	time.Sleep(2 * time.Millisecond)
+	hook(t, rec, `{"session_id":"s","hook_event_name":"SubagentStop","agent_id":"a1"}`)
+	rec.toolStarted(last, info, "t1", "SubagentHandback") // late parser events for the same span
+	rec.spanCompleted(last, info, []string{"t1"})
+
+	agent := func() telemetry.AgentNode {
+		for _, a := range store.Snapshot().Agents {
+			if a.ID == "a1" {
+				return a
+			}
+		}
+		t.Fatal("agent a1 missing")
+		return telemetry.AgentNode{}
+	}
+	if a := agent(); a.Status != "completed" || a.CompletedAt == nil || a.ActiveTool != "" {
+		t.Errorf("after late events: %+v, want still completed with no active tool", a)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	resumed := &telemetry.InferenceSpan{ID: "sub-resumed", SessionID: "s", AgentID: "a1", Role: telemetry.RoleSubagent, StartedAt: time.Now()}
+	rec.spanStarted(resumed, info)
+	if a := agent(); a.Status != "streaming" || a.CompletedAt != nil {
+		t.Errorf("after a resume: %+v, want streaming with CompletedAt cleared", a)
+	}
+}
+
 func TestWireLogRecordsHookKeysNeverValues(t *testing.T) {
 	store, err := telemetry.OpenStore("", 0)
 	if err != nil {

@@ -19,11 +19,12 @@ import (
 
 	"github.com/Revanth14/agent-tap/internal/adapters/claudecode"
 	"github.com/Revanth14/agent-tap/internal/config"
+	"github.com/Revanth14/agent-tap/internal/demo"
 	"github.com/Revanth14/agent-tap/internal/server"
 	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
 
-const usage = "usage: atap start [--port N] [--log-wire]"
+const usage = "usage: atap start [--port N] [--log-wire] [--demo]"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -47,6 +48,7 @@ func start(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
 	logWire := fs.Bool("log-wire", false, "log request/response metadata to stderr (never credentials or bodies)")
+	demoMode := fs.Bool("demo", false, "also play simulated Claude Code traffic, for inspecting the UI")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -85,12 +87,19 @@ func start(args []string) error {
 		Handler:           server.New(ln.Addr().String(), proxy, hub, rec.Routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	fmt.Fprintf(os.Stderr, "atap: proxying http://%s -> %s\n", ln.Addr(), cfg.AnthropicUpstream)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	errc := make(chan error, 2)
+	go func() { errc <- srv.Serve(ln) }()
+	fmt.Fprintf(os.Stderr, "atap: proxying http://%s -> %s\n", ln.Addr(), cfg.AnthropicUpstream)
+	if *demoMode {
+		go func() {
+			if err := demo.Run(ctx, rec, demo.Options{Speed: 1, Every: time.Minute}); err != nil {
+				errc <- fmt.Errorf("demo: %w", err)
+			}
+		}()
+		fmt.Fprintln(os.Stderr, "atap: playing demo traffic (sessions demo-vscode-N and demo-cli-N)")
+	}
 	select {
 	case err := <-errc:
 		return err
