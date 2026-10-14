@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
@@ -104,5 +105,53 @@ func TestHostGuard(t *testing.T) {
 	}
 	for len(proxied) > 0 {
 		<-proxied
+	}
+}
+
+func TestUIIsServedLocallyWithCSP(t *testing.T) {
+	srv, proxied := newTestServer(t)
+	resp := do(t, http.MethodGet, srv.URL+"/ui/", "")
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("GET /ui/ = %d, want the UI or a not-built notice", resp.StatusCode)
+	}
+	if len(proxied) != 0 {
+		t.Errorf("GET /ui/ went to the proxy")
+	}
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	r, err := noRedirect.Get(srv.URL + "/ui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusMovedPermanently || r.Header.Get("Location") != "/ui/" {
+		t.Errorf("GET /ui = %d -> %q, want a redirect to /ui/", r.StatusCode, r.Header.Get("Location"))
+	}
+}
+
+func TestUIHandler(t *testing.T) {
+	built := fstest.MapFS{
+		"index.html":         {Data: []byte("<!doctype html><title>agent-tap</title>")},
+		"assets/index-x.js":  {Data: []byte("console.log(1)")},
+		"assets/index-x.css": {Data: []byte("body{}")},
+	}
+	h := uiHandler(built)
+	for path, wantType := range map[string]string{"/ui/": "text/html", "/ui/assets/index-x.js": "text/javascript", "/ui/assets/index-x.css": "text/css"} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "127.0.0.1:9090"
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK || !strings.HasPrefix(rr.Header().Get("Content-Type"), wantType) {
+			t.Errorf("%s = %d %q, want 200 %s", path, rr.Code, rr.Header().Get("Content-Type"), wantType)
+		}
+		csp := rr.Header().Get("Content-Security-Policy")
+		if !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "connect-src 'self' ws://127.0.0.1:9090") {
+			t.Errorf("%s CSP = %q", path, csp)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	uiHandler(fstest.MapFS{".gitkeep": {}}).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/ui/", nil))
+	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "make build") {
+		t.Errorf("unbuilt UI = %d %q, want 503 pointing at make build", rr.Code, rr.Body)
 	}
 }

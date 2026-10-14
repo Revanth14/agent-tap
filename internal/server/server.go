@@ -10,8 +10,8 @@ import (
 )
 
 // New returns the daemon handler for a listener on addr (host:port). The
-// daemon's own exact routes, the hub's and the adapter routes (pattern ->
-// handler), are served locally; every other path goes to proxy, because Claude
+// daemon's own exact routes, the hub's, the UI's under /ui/, and the adapter
+// routes (pattern -> handler), are served locally; every other path goes to proxy, because Claude
 // Code sends non-/v1 paths such as HEAD /api/hello to the base URL. Everything
 // sits behind the Host check.
 func New(addr string, proxy http.Handler, hub *telemetry.Hub, routes map[string]http.Handler) http.Handler {
@@ -20,6 +20,8 @@ func New(addr string, proxy http.Handler, hub *telemetry.Hub, routes map[string]
 	for pattern, h := range routes {
 		mux.Handle(pattern, h)
 	}
+	mux.Handle("GET /ui/", uiHandler(embeddedUI()))
+	mux.Handle("GET /ui", http.RedirectHandler("/ui/", http.StatusMovedPermanently))
 	mux.Handle("/", proxy)
 	return hostGuard(addr, mux)
 }
