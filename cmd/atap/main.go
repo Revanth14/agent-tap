@@ -1,7 +1,5 @@
-// Command atap is the agent-tap daemon and CLI.
-//
-// Milestone 3 in progress: only `atap start`, running the proxy, the
-// recorder, hooks, and the state API, persisting to SQLite.
+// Command atap is the agent-tap daemon and CLI: start runs the daemon; init,
+// uninit and status wire Claude Code to it and back.
 package main
 
 import (
@@ -20,11 +18,16 @@ import (
 	"github.com/Revanth14/agent-tap/internal/adapters/claudecode"
 	"github.com/Revanth14/agent-tap/internal/config"
 	"github.com/Revanth14/agent-tap/internal/demo"
+	"github.com/Revanth14/agent-tap/internal/install"
 	"github.com/Revanth14/agent-tap/internal/server"
 	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
 
-const usage = "usage: atap start [--port N] [--log-wire] [--demo]"
+const usage = `usage:
+  atap start  [--port N] [--log-wire] [--demo]   run the daemon
+  atap init   [--port N]   install the LaunchAgent, then route Claude Code through it
+  atap uninit [--port N]   undo init: settings first, then the LaunchAgent
+  atap status [--port N]   show wiring, daemon health and what it has seen`
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -34,10 +37,40 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) == 0 || args[0] != "start" {
+	if len(args) == 0 {
 		return errors.New(usage)
 	}
-	return start(args[1:])
+	switch args[0] {
+	case "start":
+		return start(args[1:])
+	case "init", "uninit", "status":
+		return manage(args[0], args[1:])
+	}
+	return errors.New(usage)
+}
+
+// manage runs init, uninit or status for the current user.
+func manage(cmd string, args []string) error {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	port := fs.Int("port", config.DefaultPort, "daemon port")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	env, err := install.System(*port)
+	if err != nil {
+		return err
+	}
+	switch cmd {
+	case "init":
+		return install.Init(env, os.Stdout)
+	case "uninit":
+		return install.Uninit(env, os.Stdout)
+	default:
+		return install.Status(env, os.Stdout)
+	}
 }
 
 func start(args []string) error {
