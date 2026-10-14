@@ -1,0 +1,34 @@
+# Go build output
+/bin/
+*.test
+*.out
+coverage.*
+
+# Embedded UI build output. Keep the placeholder so `//go:embed all:dist`
+# still compiles on a fresh clone before the web UI is built.
+/internal/server/dist/*
+!/internal/server/dist/.gitkeep
+
+# Web
+/web/node_modules/
+/web/dist/
+/web/*.tsbuildinfo
+
+# Local data and secrets
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+
+# Local agent files: spec, agent notes, installed skills (not part of the code)
+/CLAUDE.md
+/docs/SPEC.md
+/skills-lock.json
+/.claude/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
