@@ -256,3 +256,87 @@ func TestStorePruneDeletesOldRowsFromEveryTable(t *testing.T) {
 		t.Errorf("memory-only Prune = %d, %v; want 0, nil", n, err)
 	}
 }
+
+func TestStoreLoadRestoresRecentSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := OpenStore(path, 2)
+	mustNoErr(t, err)
+	t0 := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	done := t0.Add(time.Second)
+	// One more session than the store keeps live; s00 was updated longest ago.
+	for i := range MaxLiveSessions + 1 {
+		id := fmt.Sprintf("s%02d", i)
+		mustNoErr(t, s.UpsertSession(Session{ID: id, StartedAt: t0, UpdatedAt: t0.Add(time.Duration(i) * time.Minute), TotalOutputTokens: 100 + i}))
+	}
+	mustNoErr(t, s.UpsertAgent(AgentNode{ID: "s16/main", SessionID: "s16", Status: "streaming", ActiveTool: "Bash"}))
+	for i, id := range []string{"sp1", "sp2", "sp3"} { // ring capacity is 2
+		mustNoErr(t, s.UpsertSpan(InferenceSpan{ID: id, SessionID: "s16", AgentID: "s16/main", StartedAt: t0.Add(time.Duration(i) * time.Second), Status: "completed", CompletedAt: &done}))
+	}
+	mustNoErr(t, s.UpsertSpan(InferenceSpan{ID: "sp-inflight", SessionID: "s16", AgentID: "s16/main", StartedAt: t0.Add(time.Hour), Status: "decoding"}))
+	mustNoErr(t, s.UpsertTool(ToolInvocation{ToolUseID: "tu1", SpanID: "sp3", AgentID: "s16/main", StartedAt: t0}))
+	mustNoErr(t, s.Close())
+
+	s, err = OpenStore(path, 2)
+	mustNoErr(t, err)
+	defer s.Close()
+	if n := len(s.Snapshot().Sessions); n != 0 {
+		t.Fatalf("sessions before Load = %d, want 0", n)
+	}
+	snap, err := s.Load()
+	mustNoErr(t, err)
+
+	sessions := "," + ids(snap.Sessions, func(v Session) string { return v.ID }) + ","
+	if len(snap.Sessions) != MaxLiveSessions || strings.Contains(sessions, ",s00,") || !strings.Contains(sessions, ",s16,") {
+		t.Errorf("loaded sessions = %s, want the %d most recently updated", sessions, MaxLiveSessions)
+	}
+	if got := ids(snap.Spans, func(v InferenceSpan) string { return v.ID + ":" + v.Status }); got != "sp3:completed,sp-inflight:error" {
+		t.Errorf("spans = %s, want the newest 2, the in-flight one marked an error", got)
+	}
+	for _, sp := range snap.Spans {
+		if sp.ID == "sp-inflight" && (sp.StopReason != "daemon_restarted" || sp.CompletedAt == nil) {
+			t.Errorf("in-flight span = %+v, want daemon_restarted with CompletedAt", sp)
+		}
+	}
+	if len(snap.Agents) != 1 || snap.Agents[0].Status != "idle" || snap.Agents[0].ActiveTool != "" {
+		t.Errorf("agents = %+v, want s16/main idle", snap.Agents)
+	}
+	if len(snap.Tools) != 1 {
+		t.Errorf("tools = %+v, want tu1", snap.Tools)
+	}
+
+	// The repairs were written back, so a second restart sees them too.
+	mustNoErr(t, s.Close())
+	s, err = OpenStore(path, 2)
+	mustNoErr(t, err)
+	snap, err = s.Load()
+	mustNoErr(t, err)
+	if got := ids(snap.Spans, func(v InferenceSpan) string { return v.ID + ":" + v.StopReason }); got != "sp3:,sp-inflight:daemon_restarted" {
+		t.Errorf("spans after a second restart = %s", got)
+	}
+}
+
+// A tool whose arguments were still streaming when the daemon stopped can
+// never run: Claude Code saw the stream break. Load fails it, as spanFailed
+// would have, instead of leaving it streaming forever.
+func TestStoreLoadFailsToolsOfInterruptedSpans(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := OpenStore(path, 0)
+	mustNoErr(t, err)
+	t0 := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	mustNoErr(t, s.UpsertSession(Session{ID: "s", StartedAt: t0, UpdatedAt: t0}))
+	mustNoErr(t, s.UpsertAgent(AgentNode{ID: "s/main", SessionID: "s", Status: "streaming"}))
+	mustNoErr(t, s.UpsertSpan(InferenceSpan{ID: "sp", SessionID: "s", AgentID: "s/main", StartedAt: t0, Status: "decoding"}))
+	mustNoErr(t, s.UpsertTool(ToolInvocation{ToolUseID: "tu-args", SpanID: "sp", AgentID: "s/main", StartedAt: t0, Status: "streaming_args"}))
+	mustNoErr(t, s.Close())
+
+	for restart := range 2 { // The repair is written back, so a second restart sees it too.
+		s, err = OpenStore(path, 0)
+		mustNoErr(t, err)
+		snap, err := s.Load()
+		mustNoErr(t, err)
+		if len(snap.Tools) != 1 || snap.Tools[0].Status != "failed" {
+			t.Errorf("restart %d: tools = %+v, want tu-args failed", restart+1, snap.Tools)
+		}
+		mustNoErr(t, s.Close())
+	}
+}

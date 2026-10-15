@@ -1,5 +1,5 @@
 import {
-  Background, Handle, Position, ReactFlow, ReactFlowProvider, useReactFlow,
+  Background, Controls, Handle, Position, ReactFlow, ReactFlowProvider, useNodesInitialized, useReactFlow,
   type Edge, type Node, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -18,14 +18,16 @@ interface Props {
 }
 
 export function AgentDagView(props: Props) {
+  // A fresh flow per session, so each session starts fitted.
   return (
-    <ReactFlowProvider>
+    <ReactFlowProvider key={props.view.session.id}>
       <Graph {...props} />
     </ReactFlowProvider>
   );
 }
 
 const nodeTypes = { agent: memo(AgentCard) };
+const fitOptions = { padding: 0.2, maxZoom: 1.1 }; // Never blow a lone node up past readable size
 
 function Graph({ view, selectedAgent, onSelectAgent }: Props) {
   const { nodes, edges } = useMemo(() => {
@@ -43,14 +45,14 @@ function Graph({ view, selectedAgent, onSelectAgent }: Props) {
     };
   }, [view, selectedAgent]);
 
-  // Refit when agents appear or the session changes, not on every update,
-  // so live streaming does not fight the user's pan and zoom.
+  // Refit when agents appear, not on every update, so live streaming does
+  // not fight the user's pan and zoom. Fitting before React Flow has
+  // measured the new nodes would fit nothing, so wait for that.
   const { fitView } = useReactFlow();
-  const shape = `${view.session.id}:${nodes.length}`;
+  const measured = useNodesInitialized();
   useEffect(() => {
-    const t = setTimeout(() => fitView({ duration: 250, padding: 0.2, maxZoom: 1.1 }), 50);
-    return () => clearTimeout(t);
-  }, [shape, fitView]);
+    if (measured) fitView({ ...fitOptions, duration: 250 });
+  }, [measured, nodes.length, fitView]);
 
   return (
     <ReactFlow
@@ -59,12 +61,17 @@ function Graph({ view, selectedAgent, onSelectAgent }: Props) {
       nodeTypes={nodeTypes}
       colorMode="dark"
       fitView
+      fitViewOptions={fitOptions}
       minZoom={0.2}
       nodesConnectable={false}
+      // Scrolling over the graph must not zoom it: a trackpad scroll meant
+      // for the page shrank the nodes out of sight. Pinch still zooms.
+      zoomOnScroll={false}
       onNodeClick={(_, n) => onSelectAgent(n.id)}
       style={{ background: "transparent" }}
     >
       <Background color="#1f2937" gap={24} />
+      <Controls showInteractive={false} position="bottom-left" />
     </ReactFlow>
   );
 }

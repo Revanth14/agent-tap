@@ -124,6 +124,111 @@ func (s *Store) Prune(cutoff time.Time) (int64, error) {
 	return total, nil
 }
 
+// Load reads the most recently updated sessions (up to MaxLiveSessions)
+// back into memory with their agents and their most recent spans and tools,
+// and returns the resulting snapshot. Spans that were still in flight when
+// the daemon stopped become errors ("daemon_restarted"), agents that were
+// streaming become idle, and tools whose arguments those spans were still
+// streaming fail, all in memory and in the database.
+func (s *Store) Load() (StateSnapshot, error) {
+	if s.db == nil {
+		return s.Snapshot(), nil
+	}
+	s.mu.Lock()
+	err := s.load()
+	s.mu.Unlock()
+	if err != nil {
+		return StateSnapshot{}, fmt.Errorf("telemetry: load: %w", err)
+	}
+	return s.Snapshot(), nil
+}
+
+// load does Load's work. Callers hold s.mu.
+func (s *Store) load() error {
+	sessions, err := queryRows[Session](s.db,
+		`SELECT data FROM sessions ORDER BY json_extract(data, '$.updated_at') DESC LIMIT ?`, MaxLiveSessions)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := len(sessions) - 1; i >= 0; i-- { // Oldest first, so the newest is most recently written.
+		sess := sessions[i]
+		s.liveSession(sess.ID).session = &sess
+
+		agents, err := queryRows[AgentNode](s.db, `SELECT data FROM agents WHERE session_id = ?`, sess.ID)
+		if err != nil {
+			return err
+		}
+		for _, a := range agents {
+			if a.Status == "streaming" || a.Status == "running_tool" {
+				a.Status, a.ActiveTool = "idle", ""
+				if err := s.persist(`UPDATE agents SET data = ? WHERE id = ?`, a, a.ID); err != nil {
+					return err
+				}
+			}
+			s.liveSession(sess.ID).agents[a.ID] = a
+		}
+
+		spans, err := queryRows[InferenceSpan](s.db, `SELECT data FROM (SELECT data, started_at FROM spans
+			WHERE session_id = ? ORDER BY started_at DESC LIMIT ?) ORDER BY started_at`, sess.ID, s.capacity)
+		if err != nil {
+			return err
+		}
+		interrupted := map[string]bool{}
+		for _, sp := range spans {
+			if sp.CompletedAt == nil {
+				sp.Status, sp.StopReason, sp.CompletedAt = "error", "daemon_restarted", &now
+				if err := s.persist(`UPDATE spans SET data = ? WHERE id = ?`, sp, sp.ID); err != nil {
+					return err
+				}
+				interrupted[sp.ID] = true
+			}
+			s.liveSession(sess.ID).spans.put(sp.ID, sp)
+		}
+
+		tools, err := queryRows[ToolInvocation](s.db, `SELECT data FROM (SELECT t.data, t.started_at FROM tools t
+			JOIN spans sp ON sp.id = t.span_id WHERE sp.session_id = ? ORDER BY t.started_at DESC LIMIT ?) ORDER BY started_at`,
+			sess.ID, s.capacity)
+		if err != nil {
+			return err
+		}
+		for _, t := range tools {
+			// Arguments cut off mid-stream never reach Claude Code as a
+			// tool call, so the tool can never run.
+			if interrupted[t.SpanID] && t.Status == "streaming_args" {
+				t.Status = "failed"
+				if err := s.persist(`UPDATE tools SET data = ? WHERE tool_use_id = ?`, t, t.ToolUseID); err != nil {
+					return err
+				}
+			}
+			s.liveSession(sess.ID).tools.put(t.ToolUseID, t)
+		}
+	}
+	return nil
+}
+
+// queryRows decodes the JSON data column of every row the query returns.
+func queryRows[T any](db *sql.DB, query string, args ...any) ([]T, error) {
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []T
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		var v T
+		if err := json.Unmarshal([]byte(data), &v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // Close closes the database, if any.
 func (s *Store) Close() error {
 	if s.db == nil {

@@ -98,7 +98,12 @@ func start(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "atap: %s (pruned %d rows older than %d days)\n", cfg.DBPath, pruned, int(cfg.Retention.Hours()/24))
+	restored, err := store.Load()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "atap: %s (pruned %d rows older than %d days, restored %d sessions)\n",
+		cfg.DBPath, pruned, int(cfg.Retention.Hours()/24), len(restored.Sessions))
 	hub := telemetry.NewHub(store)
 
 	var wire io.Writer
@@ -106,6 +111,7 @@ func start(args []string) error {
 		wire = os.Stderr
 	}
 	rec := claudecode.NewRecorder(store, hub)
+	rec.Restore(restored)
 	proxy, err := claudecode.NewProxy(cfg.AnthropicUpstream, rec, wire)
 	if err != nil {
 		return err

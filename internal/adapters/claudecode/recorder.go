@@ -29,9 +29,8 @@ const (
 	targetRunes           = 200
 	labelRunes            = 80
 
-	// minRateWindow is the shortest decode window with a meaningful
-	// tokens-per-second figure. A response that arrives in one burst after
-	// message_start (seen on real traffic: 157 tokens in 1ms) gets no rate.
+	// minRateWindow is the shortest request with a meaningful
+	// tokens-per-second figure.
 	minRateWindow = 100 * time.Millisecond
 )
 
@@ -86,6 +85,38 @@ func NewRecorder(store *telemetry.Store, hub *telemetry.Hub) *Recorder {
 		hub:   hub,
 		raw:   newRawBuffer(rawBufferMax),
 		live:  make(map[string]*sessionState),
+	}
+}
+
+// Restore seeds the recorder with state loaded from the store after a
+// restart, so new traffic in a restored session continues its totals instead
+// of starting a fresh record that would overwrite them. Unfinished tools are
+// kept so their results or hooks can still complete them.
+func (rec *Recorder) Restore(snap telemetry.StateSnapshot) {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	spanSession := make(map[string]string, len(snap.Spans))
+	for _, sess := range snap.Sessions {
+		c := sess
+		rec.state(sess.ID).session = &c
+	}
+	for _, a := range snap.Agents {
+		c := a
+		rec.state(a.SessionID).agents[a.ID] = &c
+	}
+	for _, sp := range snap.Spans { // Oldest first
+		spanSession[sp.ID] = sp.SessionID
+		if sp.Role == telemetry.RoleMain {
+			st := rec.state(sp.SessionID)
+			st.mainCacheRead, st.seenMain = sp.InputTokensCacheRead, true
+		}
+	}
+	for _, t := range snap.Tools {
+		sid, ok := spanSession[t.SpanID]
+		if !ok || t.Status == "completed" || t.Status == "failed" {
+			continue
+		}
+		rec.state(sid).tools[t.ToolUseID] = &toolState{inv: t, seen: true, runningAt: t.StartedAt}
 	}
 }
 
@@ -404,8 +435,13 @@ func (t *turn) complete() {
 	sp := t.span
 	sp.Status, sp.CompletedAt = "completed", &now
 	sp.DurationMs = now.Sub(sp.StartedAt).Milliseconds()
-	if decodeMs := sp.DurationMs - sp.TTFTMs; decodeMs >= minRateWindow.Milliseconds() {
-		sp.TokensPerSec = float64(sp.OutputTokens) / (float64(decodeMs) / 1000)
+	// The rate covers the whole request, not the stream after message_start:
+	// output can arrive in a burst after a long silence, so the stream's own
+	// window can be far shorter than the generation (seen live: 889 tokens
+	// in 1.2s after a 7.1s first token, "723 tok/s"). The prefill this
+	// folds in is small for typical cached turns.
+	if sp.DurationMs >= minRateWindow.Milliseconds() {
+		sp.TokensPerSec = float64(sp.OutputTokens) / (float64(sp.DurationMs) / 1000)
 	}
 	t.rec.spanCompleted(sp, t.info, t.toolIDs)
 }
@@ -553,27 +589,28 @@ func (rec *Recorder) spanCompleted(sp *telemetry.InferenceSpan, info requestInfo
 	default:
 		agent.Status, agent.ActiveTool = "idle", ""
 	}
-	rec.check(rec.store.UpsertSpan(*sp))
-	rec.broadcast(telemetry.EventSpanCompleted, *sp)
 	rec.saveAgent(agent)
 
-	sess := st.session
-	if sess == nil {
-		return
+	if sess := st.session; sess != nil {
+		// TotalInputTokens counts uncached input only; cache reads and writes
+		// have their own totals.
+		sess.TotalInputTokens += sp.InputTokensUncached
+		sess.TotalCacheWrite += sp.InputTokensCacheWrite
+		sess.TotalCacheRead += sp.InputTokensCacheRead
+		sess.TotalOutputTokens += sp.OutputTokens
+		if sp.Role == telemetry.RoleMain {
+			sess.CurrentContextSize = inputTokens(sp) + sp.OutputTokens
+			sess.MaxContextWindow = telemetry.MaxContextWindow(sp.Model, info.LongContext)
+		}
+		sess.UpdatedAt = now
+		rec.check(rec.store.UpsertSession(*sess))
+		rec.broadcast(telemetry.EventSessionUpdated, *sess)
 	}
-	// TotalInputTokens counts uncached input only; cache reads and writes
-	// have their own totals.
-	sess.TotalInputTokens += sp.InputTokensUncached
-	sess.TotalCacheWrite += sp.InputTokensCacheWrite
-	sess.TotalCacheRead += sp.InputTokensCacheRead
-	sess.TotalOutputTokens += sp.OutputTokens
-	if sp.Role == telemetry.RoleMain {
-		sess.CurrentContextSize = inputTokens(sp) + sp.OutputTokens
-		sess.MaxContextWindow = telemetry.MaxContextWindow(sp.Model, info.LongContext)
-	}
-	sess.UpdatedAt = now
-	rec.check(rec.store.UpsertSession(*sess))
-	rec.broadcast(telemetry.EventSessionUpdated, *sess)
+
+	// The span goes last: once it reads as completed, the agent and session
+	// already reflect it, for any reader of the store.
+	rec.check(rec.store.UpsertSpan(*sp))
+	rec.broadcast(telemetry.EventSpanCompleted, *sp)
 }
 
 func (rec *Recorder) spanFailed(sp *telemetry.InferenceSpan, info requestInfo, toolIDs []string) {
@@ -583,8 +620,6 @@ func (rec *Recorder) spanFailed(sp *telemetry.InferenceSpan, info requestInfo, t
 	if !settled(agent, sp) {
 		agent.Status = "error"
 	}
-	rec.check(rec.store.UpsertSpan(*sp))
-	rec.broadcast(telemetry.EventSpanCompleted, *sp)
 	for _, id := range toolIDs {
 		if ts, ok := st.tools[id]; ok && ts.inv.Status == "streaming_args" {
 			ts.inv.Status = "failed"
@@ -592,6 +627,9 @@ func (rec *Recorder) spanFailed(sp *telemetry.InferenceSpan, info requestInfo, t
 		}
 	}
 	rec.saveAgent(agent)
+	// The span goes last, as in spanCompleted.
+	rec.check(rec.store.UpsertSpan(*sp))
+	rec.broadcast(telemetry.EventSpanCompleted, *sp)
 }
 
 // track returns the span's session state and agent node, creating and saving

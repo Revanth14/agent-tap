@@ -95,10 +95,14 @@ func Init(e Env, out io.Writer) error {
 		return err
 	}
 
-	// A re-init replaces the running daemon.
+	// A re-init replaces the running daemon. launchctl bootout returns
+	// while launchd is still unloading the service, and bootstrapping it
+	// again before the unload finishes fails ("Bootstrap failed: 5"), so wait
+	// until launchd no longer knows the service, not just until the port
+	// goes quiet.
 	if _, err := os.Stat(e.plistPath()); err == nil {
 		e.Launchctl("bootout", e.service())
-		e.waitFor(func() bool { return !e.answering() })
+		e.waitFor(func() bool { return !e.loaded() && !e.answering() })
 	}
 	if e.answering() {
 		return fmt.Errorf("an atap daemon is already answering on port %d; stop it first (Ctrl-C, or atap uninit)", e.Port)
@@ -111,16 +115,16 @@ func Init(e Env, out io.Writer) error {
 	if err := writeFileAtomic(e.plistPath(), []byte(e.plist()), 0o644); err != nil {
 		return fmt.Errorf("write LaunchAgent: %w", err)
 	}
-	if err := e.Launchctl("bootstrap", fmt.Sprintf("gui/%d", e.UID), e.plistPath()); err != nil {
+	if err := e.bootstrap(); err != nil {
 		os.Remove(e.plistPath())
-		return err
+		return e.failed(s, err)
 	}
 	fmt.Fprintf(out, "installed LaunchAgent %s\n", e.plistPath())
 	if !e.waitFor(e.answering) {
 		e.Launchctl("bootout", e.service())
 		os.Remove(e.plistPath())
-		return fmt.Errorf("the daemon did not answer on %s within %s, so the LaunchAgent was removed and %s was left untouched; see %s",
-			e.baseURL(), e.HealthTimeout, e.settingsPath(), e.logPath())
+		return e.failed(s, fmt.Errorf("the daemon did not answer on %s within %s, so the LaunchAgent was removed; see %s",
+			e.baseURL(), e.HealthTimeout, e.logPath()))
 	}
 	fmt.Fprintf(out, "daemon answering on %s\n", e.baseURL())
 
@@ -218,6 +222,33 @@ func Status(e Env, out io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// loaded reports whether launchd still knows the service.
+func (e Env) loaded() bool { return e.Launchctl("print", e.service()) == nil }
+
+// bootstrap loads the LaunchAgent, retrying while launchd finishes an
+// earlier unload of the same service.
+func (e Env) bootstrap() error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = e.Launchctl("bootstrap", fmt.Sprintf("gui/%d", e.UID), e.plistPath()); err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	return err
+}
+
+// failed describes an install failure by what it means for Claude Code: on a
+// fresh init settings were never touched, but on a re-init they already route
+// through the daemon that just failed to come back.
+func (e Env) failed(s settings, err error) error {
+	if wired(s, e.env(), e.hookURL()) {
+		return fmt.Errorf("%w\nWARNING: %s still routes Claude Code through %s, which is not running; run atap init again, or atap uninit to restore direct access",
+			err, e.settingsPath(), e.baseURL())
+	}
+	return fmt.Errorf("%w; %s was left untouched", err, e.settingsPath())
 }
 
 // stateSnapshot is the part of /api/state that status prints.

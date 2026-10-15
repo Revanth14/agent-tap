@@ -261,23 +261,31 @@ func TestRecordsMainStreamingTurn(t *testing.T) {
 	if d := slices.Index(types, telemetry.EventSpanDelta); d >= 0 && d < started {
 		t.Errorf("events = %v: span.delta before span.started", types)
 	}
+	// The span is written last, so whoever sees it completed sees the agent
+	// and session it updated.
+	if n := len(types); n < 3 || types[n-3] != telemetry.EventAgentUpserted || types[n-2] != telemetry.EventSessionUpdated {
+		t.Errorf("events = %v, want agent.upserted, session.updated, then span.completed", types)
+	}
 }
 
-func TestTokensPerSecNeedsAMeasurableDecodeWindow(t *testing.T) {
+func TestTokensPerSecCoversTheWholeRequest(t *testing.T) {
 	store, err := telemetry.OpenStore("", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec := NewRecorder(store, nil)
 	tests := []struct {
-		name          string
-		ttft, elapsed time.Duration
-		wantMin       float64
-		wantMax       float64
+		name             string
+		ttft, elapsed    time.Duration
+		output           int
+		wantMin, wantMax float64
 	}{
-		// Real traffic: message_start after 2165ms, then 157 tokens within 1ms.
-		{"burst after a late message_start", 2165 * time.Millisecond, 2166 * time.Millisecond, 0, 0},
-		{"normal decode", time.Second, 3 * time.Second, 150, 250}, // 400 tokens over ~2s
+		// Real traffic: 889 tokens 1.2s after a 7.1s first token, once
+		// reported as 723 tok/s; ~107 over the whole request.
+		{"burst after a long first token", 7082 * time.Millisecond, 8312 * time.Millisecond, 889, 100, 115},
+		{"burst a millisecond after message_start", 2165 * time.Millisecond, 2166 * time.Millisecond, 157, 65, 80},
+		{"normal decode", 700 * time.Millisecond, 20 * time.Second, 2600, 125, 135},
+		{"too short to measure", 0, 50 * time.Millisecond, 10, 0, 0},
 	}
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -286,7 +294,7 @@ func TestTokensPerSecNeedsAMeasurableDecodeWindow(t *testing.T) {
 				AgentID:      "a",
 				StartedAt:    time.Now().Add(-tt.elapsed),
 				TTFTMs:       tt.ttft.Milliseconds(),
-				OutputTokens: 400,
+				OutputTokens: tt.output,
 			}
 			(&turn{rec: rec, span: sp}).complete()
 			if sp.TokensPerSec < tt.wantMin || sp.TokensPerSec > tt.wantMax {
@@ -464,7 +472,7 @@ func TestRecordsToolsAndAsyncSubagent(t *testing.T) {
 
 	post(t, f.proxyURL, mainHeaders, mainTurnRequest)
 	snap := waitFor(t, f.store, func(s telemetry.StateSnapshot) bool {
-		return len(s.Tools) == 2 && s.Tools[0].Status == "running" && s.Tools[1].Status == "running"
+		return len(s.Spans) == 1 && s.Spans[0].CompletedAt != nil
 	})
 	tools := map[string]telemetry.ToolInvocation{}
 	for _, tl := range snap.Tools {
@@ -622,5 +630,60 @@ func TestRecorderStateIsBounded(t *testing.T) {
 	}
 	if _, ok := rec.live["s0"]; ok {
 		t.Error("s0 kept; want the least recently written session dropped")
+	}
+}
+
+// TestRestoreContinuesSessionTotals covers the first turn after a daemon
+// restart: it must add to the restored session, not start a new record.
+func TestRestoreContinuesSessionTotals(t *testing.T) {
+	store, err := telemetry.OpenStore("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Now().Add(-time.Hour)
+	restored := telemetry.StateSnapshot{
+		Sessions: []telemetry.Session{{ID: "s", Provider: "claude_code", WorkspacePath: "/repo", PrimarySurface: telemetry.SurfaceVSCodeExt,
+			StartedAt: t0, TotalOutputTokens: 1000, TotalCacheRead: 500_000, MaxContextWindow: 1_000_000}},
+		Agents: []telemetry.AgentNode{{ID: "s/main", SessionID: "s", Role: telemetry.RoleMain, StartedAt: t0, TotalTokens: 501_000}},
+		Spans:  []telemetry.InferenceSpan{{ID: "old", SessionID: "s", AgentID: "s/main", Role: telemetry.RoleMain, StartedAt: t0, InputTokensCacheRead: 500_000}},
+		Tools:  []telemetry.ToolInvocation{{ToolUseID: "t-run", SpanID: "old", AgentID: "s/main", ToolName: "Bash", Status: "running", StartedAt: t0}},
+	}
+	for _, a := range restored.Agents {
+		store.UpsertAgent(a)
+	}
+	rec := NewRecorder(store, nil)
+	rec.Restore(restored)
+
+	info := requestInfo{SessionID: "s", AgentID: "s/main", AgentRole: telemetry.RoleMain, Role: telemetry.RoleMain,
+		Surface: telemetry.SurfaceVSCodeExt, ToolResults: []toolResult{{ToolUseID: "t-run"}}}
+	rec.requestArrived(info, time.Now())
+	// A cache read under half the last main turn's, after the restart: still detected.
+	sp := &telemetry.InferenceSpan{ID: "new", SessionID: "s", AgentID: "s/main", Role: telemetry.RoleMain, StartedAt: time.Now(),
+		InputTokensUncached: 20_000, InputTokensCacheRead: 100_000, OutputTokens: 50}
+	rec.spanStarted(sp, info)
+	rec.spanCompleted(sp, info, nil)
+
+	snap := store.Snapshot()
+	var sess telemetry.Session
+	for _, x := range snap.Sessions {
+		if x.ID == "s" {
+			sess = x
+		}
+	}
+	if sess.TotalOutputTokens != 1050 || sess.TotalCacheRead != 600_000 || sess.WorkspacePath != "/repo" || !sess.StartedAt.Equal(t0) {
+		t.Errorf("session = %+v, want restored totals continued", sess)
+	}
+	if !sp.CacheInvalidated {
+		t.Error("CacheInvalidated = false, want the drop against the restored turn detected")
+	}
+	for _, a := range snap.Agents {
+		if a.ID == "s/main" && a.TotalTokens != 501_000+120_050 {
+			t.Errorf("agent TotalTokens = %d, want restored total continued", a.TotalTokens)
+		}
+	}
+	for _, tl := range snap.Tools {
+		if tl.ToolUseID == "t-run" && tl.Status != "completed" {
+			t.Errorf("restored running tool = %q, want completed by the new request's tool_result", tl.Status)
+		}
 	}
 }

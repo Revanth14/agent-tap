@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,11 @@ type fakeDaemon struct {
 	calls   []string
 	onCall  func(args []string) // Observes each launchctl call
 	payload string
+	// Real launchd finishes a bootout asynchronously: the service stays
+	// loaded for a few more print calls, and bootstrap fails meanwhile.
+	unloadLag int
+	loaded    bool
+	unloading int
 }
 
 func (d *fakeDaemon) start() {
@@ -59,17 +65,38 @@ func (d *fakeDaemon) stop() {
 }
 
 func (d *fakeDaemon) launchctl(args ...string) error {
+	if args[0] == "print" {
+		if d.unloading > 0 {
+			d.unloading--
+			if d.unloading == 0 {
+				d.loaded = false
+			}
+		}
+		if !d.loaded {
+			return errors.New("Could not find service")
+		}
+		return nil
+	}
 	d.calls = append(d.calls, args[0])
 	if d.onCall != nil {
 		d.onCall(args)
 	}
 	switch args[0] {
 	case "bootstrap":
+		if d.loaded {
+			return errors.New("Bootstrap failed: 5: Input/output error")
+		}
+		d.loaded = true
 		if d.starts {
 			d.start()
 		}
 	case "bootout":
 		d.stop()
+		if d.unloadLag == 0 {
+			d.loaded = false
+		} else {
+			d.unloading = d.unloadLag
+		}
 	}
 	return nil
 }
@@ -253,6 +280,35 @@ func TestInitTwiceIsIdempotent(t *testing.T) {
 	}
 	if backup, _ := os.ReadFile(e.backupPath()); string(backup) != userSettings {
 		t.Error("second init overwrote the backup with already-wired settings")
+	}
+}
+
+// TestReinitWaitsForLaunchdToUnload reproduces "Bootstrap failed: 5": the
+// old service is still being unloaded when the new one is bootstrapped.
+func TestReinitWaitsForLaunchdToUnload(t *testing.T) {
+	e, d := newEnv(t, 3*time.Second)
+	writeUserSettings(t, e, userSettings)
+	if err := Init(e, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	d.unloadLag = 3
+	if err := Init(e, io.Discard); err != nil {
+		t.Fatalf("re-init: %v", err)
+	}
+	if !e.answering() {
+		t.Error("daemon not answering after re-init")
+	}
+}
+
+func TestReinitFailureWarnsThatSettingsStillRouteThroughTheDaemon(t *testing.T) {
+	e, d := newEnv(t, 300*time.Millisecond)
+	if err := Init(e, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	d.starts = false // The new daemon never comes up.
+	err := Init(e, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "WARNING") || !strings.Contains(err.Error(), "atap uninit") {
+		t.Fatalf("re-init failure = %v, want a warning that Claude Code still routes through the stopped daemon", err)
 	}
 }
 
