@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -32,9 +33,10 @@ CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at INTEGER NOT
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS spans (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tools (tool_use_id TEXT PRIMARY KEY, span_id TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS usage_observations (plan_window TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
 `
 
-var retainedTables = []string{"sessions", "agents", "spans", "tools"}
+var retainedTables = []string{"sessions", "agents", "spans", "tools", "usage_observations"}
 
 var (
 	errEmptyID       = errors.New("telemetry: empty id")
@@ -62,7 +64,8 @@ type Store struct {
 	capacity  int
 	live      map[string]*liveSession // by session ID
 	writes    uint64                  // write counter, for least-recently-written eviction
-	planUsage *PlanUsage              // latest only; never persisted
+	planUsage *PlanUsage              // Latest response's values, in memory
+	usage     map[string]*windowUsage // By plan window name; changes are persisted
 }
 
 type liveSession struct {
@@ -81,7 +84,7 @@ func OpenStore(path string, capacity int) (*Store, error) {
 	if capacity <= 0 {
 		capacity = DefaultRingCapacity
 	}
-	s := &Store{capacity: capacity, live: make(map[string]*liveSession)}
+	s := &Store{capacity: capacity, live: make(map[string]*liveSession), usage: make(map[string]*windowUsage)}
 	if path == "" {
 		return s, nil
 	}
@@ -129,7 +132,8 @@ func (s *Store) Prune(cutoff time.Time) (int64, error) {
 // and returns the resulting snapshot. Spans that were still in flight when
 // the daemon stopped become errors ("daemon_restarted"), agents that were
 // streaming become idle, and tools whose arguments those spans were still
-// streaming fail, all in memory and in the database.
+// streaming fail, all in memory and in the database. Plan windows get their
+// last value and current changes back (see loadUsage).
 func (s *Store) Load() (StateSnapshot, error) {
 	if s.db == nil {
 		return s.Snapshot(), nil
@@ -202,6 +206,49 @@ func (s *Store) load() error {
 				}
 			}
 			s.liveSession(sess.ID).tools.put(t.ToolUseID, t)
+		}
+	}
+	return s.loadUsage()
+}
+
+// loadUsage restores each plan window's last value and its changes in the
+// current plan window, so the burn rate survives a restart. When the last
+// value was confirmed is not known, so the next rise is Unseen. Callers hold
+// s.mu.
+func (s *Store) loadUsage() error {
+	rows, err := s.db.Query(`SELECT DISTINCT plan_window FROM usage_observations`)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		names = append(names, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, name := range names {
+		history, err := queryRows[UsageObservation](s.db, `SELECT data FROM usage_observations
+			WHERE plan_window = ?1 AND json_extract(data, '$.resets_at') IS (SELECT json_extract(data, '$.resets_at')
+				FROM usage_observations WHERE plan_window = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1)
+			ORDER BY started_at, rowid`, name)
+		if err != nil {
+			return err
+		}
+		if len(history) == 0 {
+			continue
+		}
+		last := history[len(history)-1]
+		s.usage[name] = &windowUsage{
+			last:    UsageWindow{Name: name, Utilization: last.Utilization, ResetsAt: last.ResetsAt, Status: last.Status},
+			known:   true,
+			history: history,
 		}
 	}
 	return nil
@@ -301,17 +348,104 @@ func (s *Store) UpsertTool(t ToolInvocation) error {
 		t, t.ToolUseID, t.SpanID, t.StartedAt.UnixMilli())
 }
 
-// SetPlanUsage replaces the account-level plan usage. Only the latest value is
-// kept, in memory: every response carrying usage headers refreshes it, so
-// there is nothing to persist.
-func (s *Store) SetPlanUsage(u PlanUsage) {
+// RecordPlanUsage applies the plan usage a response reported, from the span
+// spanID of session sessionID (either may be empty), and returns the latest
+// plan usage. A window whose value changed gets a UsageObservation, bucketed
+// from the spans in flight since its previous value was last confirmed, so
+// record the response's span before its usage. A response observed before one
+// already applied changes nothing: responses can be processed out of order.
+func (s *Store) RecordPlanUsage(u PlanUsage, sessionID, spanID string) (PlanUsage, error) {
 	u.Windows = slices.Clone(u.Windows)
 	for i := range u.Windows {
 		u.Windows[i].ResetsAt = cloneTime(u.Windows[i].ResetsAt)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.planUsage = &u
+	if s.planUsage == nil || !u.ObservedAt.Before(s.planUsage.ObservedAt) {
+		s.planUsage = &u
+	}
+	latest := *s.planUsage
+
+	at := u.ObservedAt
+	for _, w := range u.Windows {
+		st := s.usage[w.Name]
+		if st == nil {
+			st = &windowUsage{}
+			s.usage[w.Name] = st
+		}
+		if st.confirmedAt != nil && at.Before(*st.confirmedAt) {
+			continue
+		}
+		if st.known && st.last.Utilization == w.Utilization && sameTime(st.last.ResetsAt, w.ResetsAt) && st.last.Status == w.Status {
+			st.confirmedAt = &at
+			continue
+		}
+		obs := UsageObservation{
+			Window: w.Name, Utilization: w.Utilization, ResetsAt: w.ResetsAt, Status: w.Status,
+			ObservedAt: at, Since: st.confirmedAt, SessionID: sessionID, SpanID: spanID,
+		}
+		newWindow := !sameTime(st.last.ResetsAt, w.ResetsAt)
+		if st.known {
+			prev := st.last.Utilization
+			if newWindow {
+				prev = 0
+			}
+			obs.Rise = math.Round((w.Utilization-prev)*1e4) / 1e4 // Drop float noise: 0.46-0.45 is 0.010000000000000009
+		}
+		obs.Bucket, obs.Sessions = attribute(s.allSpans(), obs.Since, at)
+		if err := s.persist(`INSERT INTO usage_observations (data, plan_window, started_at) VALUES (?, ?, ?)`,
+			obs, obs.Window, at.UnixMilli()); err != nil {
+			return latest, err
+		}
+		if newWindow {
+			st.history = nil
+		}
+		st.history = append(st.history, obs)
+		st.last, st.known, st.confirmedAt = w, true, &at
+	}
+	return latest, nil
+}
+
+// UsageHistory returns the changes of plan window window (e.g. "5h") in its
+// current plan window, oldest first.
+func (s *Store) UsageHistory(window string) []UsageObservation {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if st := s.usage[window]; st != nil {
+		return slices.Clone(st.history)
+	}
+	return nil
+}
+
+// StatusLine is the one-line plan and context summary for sessionID's status
+// bar (see statusLine). An unknown session leaves out the context part.
+func (s *Store) StatusLine(sessionID string, now time.Time) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var burns []Burn
+	if s.planUsage != nil {
+		for _, w := range s.planUsage.Windows {
+			var history []UsageObservation
+			if st := s.usage[w.Name]; st != nil {
+				history = st.history
+			}
+			burns = append(burns, burn(w, history, now))
+		}
+	}
+	var sess *Session
+	if ls, ok := s.live[sessionID]; ok {
+		sess = ls.session
+	}
+	return statusLine(burns, sess, now)
+}
+
+// allSpans returns every live span. Callers hold s.mu.
+func (s *Store) allSpans() []InferenceSpan {
+	var out []InferenceSpan
+	for _, ls := range s.live {
+		out = append(out, ls.spans.items()...)
+	}
+	return out
 }
 
 // toolSessionID finds the live session that already holds t, else the one

@@ -128,6 +128,11 @@ func Init(e Env, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "daemon answering on %s\n", e.baseURL())
 
+	if err := e.installMod(); err != nil {
+		return fmt.Errorf("install status line mod: %w", err)
+	}
+	fmt.Fprintf(out, "installed status line mod %s\n", e.modDir())
+
 	env := e.env()
 	if !wired(s, env, e.hookURL()) {
 		if raw != nil {
@@ -142,10 +147,11 @@ func Init(e Env, out io.Writer) error {
 		}
 	}
 	wire(s, env, e.hookURL())
+	addPluginDir(s, e.modDir())
 	if err := writeSettings(e.settingsPath(), s, mode); err != nil {
 		return fmt.Errorf("write settings: %w", err)
 	}
-	fmt.Fprintf(out, "wired %s: %s, hooks %s\n", e.settingsPath(), strings.Join(sortedKeys(env), ", "), strings.Join(hookEvents, ", "))
+	fmt.Fprintf(out, "wired %s: %s, hooks %s, mod in %s\n", e.settingsPath(), strings.Join(sortedKeys(env), ", "), strings.Join(hookEvents, ", "), envPluginDirs)
 	fmt.Fprintln(out, "New Claude Code sessions now route through atap; sessions already open keep their old settings.")
 	return nil
 }
@@ -164,11 +170,17 @@ func Uninit(e Env, out io.Writer) error {
 			json.Unmarshal(data, &state)
 		}
 		unwire(s, env, state.Env, e.hookURL())
+		removePluginDir(s, e.modDir())
 		if err := writeSettings(e.settingsPath(), s, mode); err != nil {
 			return fmt.Errorf("write settings: %w", err)
 		}
 		os.Remove(e.statePath())
 		fmt.Fprintf(out, "unwired %s\n", e.settingsPath())
+	} else if removePluginDir(s, e.modDir()) {
+		if err := writeSettings(e.settingsPath(), s, mode); err != nil {
+			return fmt.Errorf("write settings: %w", err)
+		}
+		fmt.Fprintf(out, "removed the status line mod from %s in %s\n", envPluginDirs, e.settingsPath())
 	} else {
 		fmt.Fprintf(out, "%s was not wired to atap\n", e.settingsPath())
 	}
@@ -196,6 +208,9 @@ func Status(e Env, out io.Writer) error {
 	_, plistErr := os.Stat(e.plistPath())
 	fmt.Fprintf(out, "settings:    %s (%s)\n", yesNo(isWired, "wired to atap", "not wired"), e.settingsPath())
 	fmt.Fprintf(out, "LaunchAgent: %s\n", yesNo(plistErr == nil, "installed", "not installed"))
+	settingsEnv, _ := s["env"].(map[string]any)
+	dirs, _ := settingsEnv[envPluginDirs].(string)
+	fmt.Fprintf(out, "status line: %s\n", yesNo(slices.Contains(filepath.SplitList(dirs), e.modDir()), "mod in "+envPluginDirs, "mod not loaded"))
 
 	snap, err := e.state()
 	if err != nil {

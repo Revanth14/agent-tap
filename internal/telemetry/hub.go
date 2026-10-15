@@ -50,9 +50,10 @@ func NewHub(store *Store) *Hub {
 	return &Hub{store: store, clients: make(map[*wsClient]struct{})}
 }
 
-// Register mounts GET /api/state and GET /api/ws on mux.
+// Register mounts GET /api/state, GET /api/statusline and GET /api/ws on mux.
 func (h *Hub) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/state", h.serveState)
+	mux.HandleFunc("GET /api/statusline", h.serveStatusLine)
 	mux.HandleFunc("GET /api/ws", h.serveWS)
 }
 
@@ -63,6 +64,14 @@ func (h *Hub) serveState(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(h.store.Snapshot()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// serveStatusLine writes the status line for the session named by the
+// session query parameter, as plain text.
+func (h *Hub) serveStatusLine(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprint(w, h.store.StatusLine(r.URL.Query().Get("session"), time.Now()))
 }
 
 // serveWS upgrades to a WebSocket, sends a snapshot event, then streams every

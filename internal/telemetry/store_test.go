@@ -138,13 +138,16 @@ func TestStorePlanUsage(t *testing.T) {
 		t.Fatal("PlanUsage before any update: want nil")
 	}
 
-	s.SetPlanUsage(PlanUsage{Provider: "claude_code", Windows: []UsageWindow{{Name: "5h", Utilization: 0.42, Status: "allowed"}}})
+	t0 := time.Date(2026, 10, 14, 15, 0, 0, 0, time.UTC)
+	_, err = s.RecordPlanUsage(PlanUsage{Provider: "claude_code", ObservedAt: t0, Windows: []UsageWindow{{Name: "5h", Utilization: 0.42, Status: "allowed"}}}, "", "")
+	mustNoErr(t, err)
 	reset := time.Date(2026, 10, 14, 19, 0, 0, 0, time.UTC)
 	windows := []UsageWindow{
 		{Name: "5h", Utilization: 0.46, ResetsAt: &reset, Status: "allowed"},
 		{Name: "7d", Utilization: 0.13, Status: "allowed"},
 	}
-	s.SetPlanUsage(PlanUsage{Provider: "claude_code", Windows: windows})
+	_, err = s.RecordPlanUsage(PlanUsage{Provider: "claude_code", ObservedAt: t0.Add(time.Minute), Windows: windows}, "", "")
+	mustNoErr(t, err)
 	// The store must hold its own copy of the windows and their reset times.
 	windows[0].Utilization = 0.99
 	reset = time.Time{}

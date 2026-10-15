@@ -393,6 +393,52 @@ func TestRecordsPlanUsageAndHTTPErrors(t *testing.T) {
 	}
 }
 
+// The rise a response reveals is filed under that response's session and
+// span, after the span is stored so that it counts as in flight.
+func TestAttributesPlanUsageToTheRevealingResponse(t *testing.T) {
+	usage := func(util, status string) map[string]string {
+		return map[string]string{
+			"Anthropic-Ratelimit-Unified-5h-Utilization": util,
+			"Anthropic-Ratelimit-Unified-5h-Reset":       "1792005000",
+			"Anthropic-Ratelimit-Unified-5h-Status":      status,
+		}
+	}
+	turnWithID := func(id string) string {
+		return sseTurn(
+			`{"type":"message_start","message":{"id":"`+id+`","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":1}}}`,
+			`{"type":"message_stop"}`,
+		)
+	}
+	f := newRecFixture(t, scripted(t,
+		sseResponse(turnWithID("msg_a"), usage("0.42", "allowed")),
+		sseResponse(turnWithID("msg_b"), usage("0.43", "allowed")),
+		func(w http.ResponseWriter, r *http.Request) { // The plan limit itself
+			for k, v := range usage("1.0", "rejected") {
+				w.Header().Set(k, v)
+			}
+			w.Header().Set("Request-Id", "req_limit")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error"}}`)
+		},
+	))
+	for range 3 {
+		post(t, f.proxyURL, mainHeaders, mainTurnRequest)
+	}
+	waitFor(t, f.store, func(telemetry.StateSnapshot) bool { return len(f.store.UsageHistory("5h")) == 3 })
+
+	h := f.store.UsageHistory("5h")
+	if got := h[0]; got.SessionID != "sess-1" || got.SpanID != "msg_a" || got.Bucket != telemetry.BucketUnseen {
+		t.Errorf("first value = %+v, want from sess-1's msg_a, Unseen (nothing came before)", got)
+	}
+	if got := h[1]; got.SpanID != "msg_b" || got.Rise != 0.01 || got.Bucket != telemetry.BucketAttributed || strings.Join(got.Sessions, ",") != "sess-1" {
+		t.Errorf("rise = %+v, want 0.01 from msg_b, Attributed to sess-1", got)
+	}
+	if got := h[2]; got.SpanID != "req_limit" || got.Status != "rejected" || got.Bucket != telemetry.BucketAttributed {
+		t.Errorf("limit = %+v, want rejected from req_limit, Attributed", got)
+	}
+}
+
 func TestRecordsUnreachableUpstream(t *testing.T) {
 	down := httptest.NewServer(http.NotFoundHandler())
 	url := down.URL

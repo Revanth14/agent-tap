@@ -1,0 +1,6 @@
+{
+  "name": "atap",
+  "version": "0.1.0",
+  "description": "Shows plan usage, burn rate and context size from the local agent-tap daemon in the status line",
+  "author": { "name": "Revanth Ch" }
+}

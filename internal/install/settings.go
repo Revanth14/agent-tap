@@ -7,12 +7,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 )
 
 const (
 	envBaseURL    = "ANTHROPIC_BASE_URL"
 	envToolSearch = "ENABLE_TOOL_SEARCH"
 	envHints      = "CLAUDE_CODE_GATEWAY_HINT_HEADERS"
+	envPluginDirs = "CLAUDE_CODE_PLUGIN_DIRS"
 )
 
 // hookEvents are the hooks the recorder consumes; nothing else is registered.
@@ -193,6 +196,43 @@ func hasHookURL(groups any, hookURL string) bool {
 		}
 	}
 	return false
+}
+
+// addPluginDir appends dir to the CLAUDE_CODE_PLUGIN_DIRS path list, keeping
+// any folders already there.
+func addPluginDir(s settings, dir string) {
+	e := child(s, "env")
+	cur, _ := e[envPluginDirs].(string)
+	dirs := filepath.SplitList(cur)
+	if slices.Contains(dirs, dir) {
+		return
+	}
+	e[envPluginDirs] = strings.Join(append(dirs, dir), string(os.PathListSeparator))
+}
+
+// removePluginDir removes dir, and only dir, from the CLAUDE_CODE_PLUGIN_DIRS
+// path list, dropping the key once the list is empty. It reports whether it
+// changed s.
+func removePluginDir(s settings, dir string) bool {
+	e, _ := s["env"].(map[string]any)
+	cur, ok := e[envPluginDirs].(string)
+	if !ok {
+		return false
+	}
+	dirs := filepath.SplitList(cur)
+	kept := slices.DeleteFunc(slices.Clone(dirs), func(d string) bool { return d == dir })
+	if len(kept) == len(dirs) {
+		return false
+	}
+	if len(kept) == 0 {
+		delete(e, envPluginDirs)
+	} else {
+		e[envPluginDirs] = strings.Join(kept, string(os.PathListSeparator))
+	}
+	if len(e) == 0 {
+		delete(s, "env")
+	}
+	return true
 }
 
 // priorEnv captures the env keys' values before init; nil means absent.

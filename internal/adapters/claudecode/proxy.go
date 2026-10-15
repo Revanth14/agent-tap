@@ -56,11 +56,10 @@ func NewProxy(upstream string, rec *Recorder, wireOut io.Writer) (*Proxy, error)
 			if p.wire != nil {
 				p.wire.response(resp)
 			}
-			if p.rec != nil {
-				p.rec.ObserveUsage(resp.Header)
-			}
 			if t, ok := resp.Request.Context().Value(turnKey{}).(*turn); ok {
 				t.response(resp)
+			} else if p.rec != nil {
+				p.rec.ObserveUsage(resp.Header)
 			}
 			return nil
 		},

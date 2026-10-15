@@ -120,18 +120,22 @@ func (rec *Recorder) Restore(snap telemetry.StateSnapshot) {
 	}
 }
 
-// ObserveUsage records the plan usage-limit headers of any upstream
-// response. A response without them, such as a throttling 429, leaves the
-// last value in place.
+// ObserveUsage records the plan usage-limit headers of an upstream response
+// that is not a recorded /v1/messages turn; a turn records its own, once its
+// span is stored. A response without them, such as a throttling 429, leaves
+// the last value in place.
 func (rec *Recorder) ObserveUsage(h http.Header) {
-	u, ok := planUsage(h, time.Now().UTC())
-	if !ok {
-		return
+	if u, ok := planUsage(h, time.Now().UTC()); ok {
+		rec.recordUsage(u, "", "")
 	}
+}
+
+func (rec *Recorder) recordUsage(u telemetry.PlanUsage, sessionID, spanID string) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	rec.store.SetPlanUsage(u)
-	rec.broadcast(telemetry.EventUsageUpdated, u)
+	latest, err := rec.store.RecordPlanUsage(u, sessionID, spanID)
+	rec.check(err)
+	rec.broadcast(telemetry.EventUsageUpdated, latest)
 }
 
 func planUsage(h http.Header, now time.Time) (telemetry.PlanUsage, bool) {
@@ -167,12 +171,14 @@ type turn struct {
 	// Set by response before the parser goroutine starts.
 	status    int
 	requestID string
+	usage     *telemetry.PlanUsage // The response's usage-limit headers, if any
 
 	// Owned by the parser goroutine.
 	span      *telemetry.InferenceSpan
 	blocks    map[int]*toolBlock // Tool calls being streamed, by content index
 	toolIDs   []string           // Tool calls in this response, in order
 	lastDelta time.Time
+	usageDone bool // usage has been recorded
 }
 
 type toolBlock struct {
@@ -197,6 +203,9 @@ func (rec *Recorder) begin(h http.Header, body []byte) *turn {
 // never blocks the stream to Claude Code.
 func (t *turn) response(resp *http.Response) {
 	t.status, t.requestID = resp.StatusCode, resp.Header.Get("Request-Id")
+	if u, ok := planUsage(resp.Header, time.Now().UTC()); ok {
+		t.usage = &u
+	}
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	var parse func(io.Reader)
 	switch {
@@ -207,6 +216,10 @@ func (t *turn) response(resp *http.Response) {
 	case mediaType == "application/json":
 		parse = t.parseJSON
 	default:
+		go func() {
+			<-t.ready
+			t.recordUsage("")
+		}()
 		return
 	}
 	tap := newStreamTap()
@@ -216,6 +229,7 @@ func (t *turn) response(resp *http.Response) {
 		<-t.ready
 		raw := &cappedBuffer{limit: rawPayloadMax}
 		parse(io.TeeReader(tap, raw))
+		t.recordUsage("") // No span started, e.g. a stream without message_start
 		if t.span == nil {
 			return
 		}
@@ -390,6 +404,17 @@ func (t *turn) start(msg sseMessage) {
 	}
 	t.span = sp
 	t.rec.spanStarted(sp, t.info)
+	t.recordUsage(sp.ID)
+}
+
+// recordUsage records the response's plan usage once, after its span (if
+// any) is stored, so attribution counts this request as in flight.
+func (t *turn) recordUsage(spanID string) {
+	if t.usage == nil || t.usageDone {
+		return
+	}
+	t.usageDone = true
+	t.rec.recordUsage(*t.usage, t.info.SessionID, spanID)
 }
 
 // errorSpan records a request that failed before any message started.
@@ -401,6 +426,7 @@ func (t *turn) errorSpan(reason string) {
 	sp.DurationMs = now.Sub(t.startedAt).Milliseconds()
 	t.span = sp
 	t.rec.spanFailed(sp, t.info, nil)
+	t.recordUsage(sp.ID)
 }
 
 func (t *turn) toolStart(index int, id, name string) {

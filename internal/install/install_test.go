@@ -215,6 +215,42 @@ func TestInitInstallsThenWires(t *testing.T) {
 	if backup, _ := os.ReadFile(e.backupPath()); string(backup) != userSettings {
 		t.Errorf("backup = %q, want the original bytes", backup)
 	}
+
+	if env[envPluginDirs] != e.modDir() {
+		t.Errorf("%s = %v, want the mod folder %s", envPluginDirs, env[envPluginDirs], e.modDir())
+	}
+	for _, f := range []string{".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts", "hooks/status.ts"} {
+		if _, err := os.Stat(filepath.Join(e.modDir(), f)); err != nil {
+			t.Errorf("mod file %s: %v", f, err)
+		}
+	}
+	if daemon, _ := os.ReadFile(filepath.Join(e.modDir(), modDaemonFile)); !strings.Contains(string(daemon), "'"+e.baseURL()+"'") {
+		t.Errorf("%s = %q, want this daemon's URL %s", modDaemonFile, daemon, e.baseURL())
+	}
+	if _, err := os.Stat(filepath.Join(e.modDir(), "tests")); !os.IsNotExist(err) {
+		t.Errorf("mod tests were installed: %v", err)
+	}
+}
+
+// Init adds its mod to the user's own plugin folders, once, and uninit takes
+// out only its own.
+func TestPluginDirsKeepTheUsersFolders(t *testing.T) {
+	e, _ := newEnv(t, 3*time.Second)
+	writeUserSettings(t, e, `{"env": {"CLAUDE_CODE_PLUGIN_DIRS": "/Users/me/mods:/opt/mods"}}`)
+	for range 2 {
+		if err := Init(e, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := loadSettings(t, e)["env"].(map[string]any)[envPluginDirs]; got != "/Users/me/mods:/opt/mods:"+e.modDir() {
+		t.Errorf("after two inits %s = %v, want the user's folders, then the mod's once", envPluginDirs, got)
+	}
+	if err := Uninit(e, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadSettings(t, e)["env"].(map[string]any)[envPluginDirs]; got != "/Users/me/mods:/opt/mods" {
+		t.Errorf("after uninit %s = %v, want only the user's folders", envPluginDirs, got)
+	}
 }
 
 func TestInitRollsBackWhenTheDaemonNeverAnswers(t *testing.T) {
@@ -383,7 +419,7 @@ func TestStatus(t *testing.T) {
 		`"plan_usage":{"windows":[{"name":"5h","utilization":0.17,"resets_at":"2026-10-15T00:40:00Z"}]}}`
 	var out bytes.Buffer
 	Status(e, &out)
-	for _, want := range []string{"wired to atap", "LaunchAgent: installed", "answering", "1 live", "tokens:      2050", "cache hits:  75.0%", "5h 17%"} {
+	for _, want := range []string{"wired to atap", "LaunchAgent: installed", "answering", "1 live", "tokens:      2050", "cache hits:  75.0%", "5h 17%", "status line: mod in " + envPluginDirs} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("status lacks %q:\n%s", want, out.String())
 		}
