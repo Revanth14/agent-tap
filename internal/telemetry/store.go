@@ -439,6 +439,16 @@ func (s *Store) StatusLine(sessionID string, now time.Time) string {
 	return statusLine(burns, sess, now)
 }
 
+// Alerts lists the thresholds the latest plan usage has crossed (see alerts).
+func (s *Store) Alerts(now time.Time) []Alert {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.planUsage == nil {
+		return []Alert{}
+	}
+	return alerts(s.planUsage.Windows, now)
+}
+
 // allSpans returns every live span. Callers hold s.mu.
 func (s *Store) allSpans() []InferenceSpan {
 	var out []InferenceSpan

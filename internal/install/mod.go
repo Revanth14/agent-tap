@@ -11,7 +11,7 @@ import (
 // modFS is the Claude Code mod that shows the daemon's status line. Its tests
 // stay in the repository.
 //
-//go:embed mod/.claude-plugin/plugin.json mod/hooks
+//go:embed mod/.claude-plugin/plugin.json mod/hooks mod/types
 var modFS embed.FS
 
 // modDaemonFile is the mod's one generated file: it names the daemon's URL.

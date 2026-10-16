@@ -219,7 +219,7 @@ func TestInitInstallsThenWires(t *testing.T) {
 	if env[envPluginDirs] != e.modDir() {
 		t.Errorf("%s = %v, want the mod folder %s", envPluginDirs, env[envPluginDirs], e.modDir())
 	}
-	for _, f := range []string{".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts", "hooks/status.ts"} {
+	for _, f := range []string{".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts", "hooks/status.ts", "hooks/alerts.ts", "types/index.d.ts"} {
 		if _, err := os.Stat(filepath.Join(e.modDir(), f)); err != nil {
 			t.Errorf("mod file %s: %v", f, err)
 		}

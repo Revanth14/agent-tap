@@ -50,10 +50,12 @@ func NewHub(store *Store) *Hub {
 	return &Hub{store: store, clients: make(map[*wsClient]struct{})}
 }
 
-// Register mounts GET /api/state, GET /api/statusline and GET /api/ws on mux.
+// Register mounts GET /api/state, GET /api/statusline, GET /api/alerts and
+// GET /api/ws on mux.
 func (h *Hub) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/state", h.serveState)
 	mux.HandleFunc("GET /api/statusline", h.serveStatusLine)
+	mux.HandleFunc("GET /api/alerts", h.serveAlerts)
 	mux.HandleFunc("GET /api/ws", h.serveWS)
 }
 
@@ -72,6 +74,15 @@ func (h *Hub) serveStatusLine(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprint(w, h.store.StatusLine(r.URL.Query().Get("session"), time.Now()))
+}
+
+// serveAlerts writes the crossed plan usage thresholds as a JSON array.
+func (h *Hub) serveAlerts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(h.store.Alerts(time.Now())); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 // serveWS upgrades to a WebSocket, sends a snapshot event, then streams every

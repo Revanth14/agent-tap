@@ -1,19 +1,42 @@
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+import { newAlerts } from './alerts.ts'
 import { DAEMON } from './daemon.ts'
 import { statusText } from './status.ts'
 
 // A turn's end refreshes the line at once; the timer keeps it current through
 // long tool loops and while idle.
 const REFRESH_MS = 15_000
+const TOAST_MS = 15_000 // How long an alert stays
+
+// The alerts this session has shown. Session state outlives a reload of the
+// mod, so a reload does not repeat them.
+const shown = atom({ plugin: 'atap', key: 'shownAlerts' } as const, [])
+
+let checking = false // A timer tick and a turn's end must not toast the same alert twice
+
+async function fetchDaemon($: EngineInterface, path: string) {
+  try {
+    return await $.http.fetch(`${DAEMON}${path}`)
+  } catch {
+    return undefined
+  }
+}
 
 async function refresh($: EngineInterface): Promise<void> {
-  let res
+  const session = encodeURIComponent(await $.session.id())
+  $.ui.status(statusText(await fetchDaemon($, `/api/statusline?session=${session}`)))
+
+  if (checking) return
+  checking = true
   try {
-    res = await $.http.fetch(`${DAEMON}/api/statusline?session=${encodeURIComponent(await $.session.id())}`)
-  } catch {
-    res = undefined
+    for (const alert of newAlerts(await fetchDaemon($, '/api/alerts'), await read($, shown))) {
+      $.ui.toast(alert.text, { timeoutMs: TOAST_MS })
+      await update($, shown, ids => [...ids, alert.id].slice(-50))
+    }
+  } finally {
+    checking = false
   }
-  $.ui.status(statusText(res))
 }
 
 export const register: Register = on => {

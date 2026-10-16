@@ -278,3 +278,60 @@ func TestHubServeStatusLine(t *testing.T) {
 		t.Errorf("GET /api/statusline = %q (%s), want %q", body, ct, want)
 	}
 }
+
+func TestAlerts(t *testing.T) {
+	zone := time.FixedZone("UTC+2", 2*60*60)
+	now := u0.In(zone)
+	reset := time.Date(2026, 10, 15, 12, 20, 0, 0, time.UTC) // 14:20 in zone
+	past := u0.Add(-time.Minute)
+	tests := []struct {
+		name    string
+		windows []UsageWindow
+		want    string // id|text per alert, joined by ";"
+	}{
+		{"below every threshold", []UsageWindow{{Name: "5h", Utilization: 0.79, ResetsAt: &reset}, {Name: "7d", Utilization: 0.89}}, ""},
+		{"5h past 80%", []UsageWindow{{Name: "5h", Utilization: 0.83, ResetsAt: &reset}},
+			"5h@1792066800/80|5h plan window at 83% (past 80%) · resets 14:20"},
+		{"only the highest threshold", []UsageWindow{{Name: "5h", Utilization: 0.9, ResetsAt: &reset}},
+			"5h@1792066800/90|5h plan window at 90% (past 90%) · resets 14:20"},
+		{"7d warns at 90% only", []UsageWindow{{Name: "7d", Utilization: 0.85}, {Name: "7d", Utilization: 0.91}},
+			"7d@0/90|7d plan window at 91% (past 90%)"},
+		{"a reset window is quiet", []UsageWindow{{Name: "5h", Utilization: 0.95, ResetsAt: &past}}, ""},
+		{"windows without thresholds are quiet", []UsageWindow{{Name: "1h", Utilization: 1}}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, a := range alerts(tt.windows, now) {
+				got = append(got, a.ID+"|"+a.Text)
+			}
+			if strings.Join(got, ";") != tt.want {
+				t.Errorf("alerts =\n  %q\nwant\n  %q", strings.Join(got, ";"), tt.want)
+			}
+		})
+	}
+}
+
+func TestHubServeAlerts(t *testing.T) {
+	s, _, srv, _ := newTestHub(t)
+	get := func() string {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/api/alerts")
+		mustNoErr(t, err)
+		defer resp.Body.Close()
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q", ct)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		return strings.TrimSpace(string(body))
+	}
+	if got := get(); got != "[]" {
+		t.Errorf("before any plan usage = %s, want []", got)
+	}
+	reset := time.Now().Add(time.Hour)
+	_, err := s.RecordPlanUsage(PlanUsage{ObservedAt: time.Now(), Windows: []UsageWindow{{Name: "5h", Utilization: 0.81, ResetsAt: &reset}}}, "", "")
+	mustNoErr(t, err)
+	if got := get(); !strings.Contains(got, `"id":"5h@`) || !strings.Contains(got, `"threshold":0.8`) {
+		t.Errorf("past 80%% = %s, want the 5h alert", got)
+	}
+}

@@ -17,6 +17,21 @@ const IdleGap = 5 * time.Minute
 // BurnLookback is how far back the burn rate looks.
 const BurnLookback = 30 * time.Minute
 
+// AlertThresholds are the utilizations, per plan window, at which atap warns.
+var AlertThresholds = map[string][]float64{"5h": {0.8, 0.9}, "7d": {0.9}}
+
+// Alert is the highest threshold a plan window has crossed. Its ID names the
+// window, its reset and the threshold, so the same crossing keeps its ID and
+// a new plan window starts over.
+type Alert struct {
+	ID          string     `json:"id"`
+	Window      string     `json:"window"`
+	Threshold   float64    `json:"threshold"`
+	Utilization float64    `json:"utilization"`
+	ResetsAt    *time.Time `json:"resets_at,omitempty"`
+	Text        string     `json:"text"` // e.g. "5h plan window at 83% (past 80%) · resets 14:20"
+}
+
 // Bucket says whom a usage observation's rise can be put down to. A rise is
 // never split between sessions.
 type Bucket string
@@ -194,6 +209,37 @@ func statusLine(burns []Burn, sess *Session, now time.Time) string {
 		parts = append(parts, ctx)
 	}
 	return strings.Join(parts, " · ")
+}
+
+// alerts lists, for each window, the highest AlertThresholds entry its
+// utilization has reached, skipping windows that have reset since.
+func alerts(windows []UsageWindow, now time.Time) []Alert {
+	out := []Alert{}
+	for _, w := range windows {
+		if w.ResetsAt != nil && !now.Before(*w.ResetsAt) {
+			continue
+		}
+		var crossed float64
+		for _, th := range AlertThresholds[w.Name] {
+			if w.Utilization >= th && th > crossed {
+				crossed = th
+			}
+		}
+		if crossed == 0 {
+			continue
+		}
+		var reset int64
+		text := fmt.Sprintf("%s plan window at %d%% (past %d%%)", w.Name, percent(w.Utilization), percent(crossed))
+		if w.ResetsAt != nil {
+			reset = w.ResetsAt.Unix()
+			text += " · resets " + w.ResetsAt.In(now.Location()).Format("15:04")
+		}
+		out = append(out, Alert{
+			ID:     fmt.Sprintf("%s@%d/%d", w.Name, reset, percent(crossed)),
+			Window: w.Name, Threshold: crossed, Utilization: w.Utilization, ResetsAt: w.ResetsAt, Text: text,
+		})
+	}
+	return out
 }
 
 func percent(f float64) int { return int(math.Round(f * 100)) }
