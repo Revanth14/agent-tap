@@ -365,7 +365,10 @@ func TestRecordsPlanUsageAndHTTPErrors(t *testing.T) {
 	if w := u.Windows[0]; w.Name != "5h" || w.Utilization != 0.42 || w.Status != "allowed" || w.ResetsAt == nil || !w.ResetsAt.Equal(time.Unix(1792005000, 0)) {
 		t.Errorf("5h window = %+v", w)
 	}
-	if w := u.Windows[1]; w.Name != "7d" || w.Utilization != 0.12 || w.ResetsAt != nil {
+	if w := u.Windows[0]; w.Length != 5*time.Hour {
+		t.Errorf("5h window length = %v", w.Length)
+	}
+	if w := u.Windows[1]; w.Name != "7d" || w.Utilization != 0.12 || w.ResetsAt != nil || w.Length != 7*24*time.Hour {
 		t.Errorf("7d window = %+v", w)
 	}
 

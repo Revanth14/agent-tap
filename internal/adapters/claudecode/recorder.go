@@ -138,6 +138,9 @@ func (rec *Recorder) recordUsage(u telemetry.PlanUsage, sessionID, spanID string
 	rec.broadcast(telemetry.EventUsageUpdated, latest)
 }
 
+// windowLengths are the spans of Anthropic's plan windows, named after them.
+var windowLengths = map[string]time.Duration{"5h": 5 * time.Hour, "7d": 7 * 24 * time.Hour}
+
 func planUsage(h http.Header, now time.Time) (telemetry.PlanUsage, bool) {
 	var windows []telemetry.UsageWindow
 	for _, name := range []string{"5h", "7d"} {
@@ -146,7 +149,7 @@ func planUsage(h http.Header, now time.Time) (telemetry.PlanUsage, bool) {
 		if util == "" && status == "" && reset == "" {
 			continue
 		}
-		w := telemetry.UsageWindow{Name: name, Status: status}
+		w := telemetry.UsageWindow{Name: name, Status: status, Length: windowLengths[name]}
 		w.Utilization, _ = strconv.ParseFloat(util, 64) // Already a 0-1 fraction
 		if secs, err := strconv.ParseInt(reset, 10, 64); err == nil {
 			at := time.Unix(secs, 0).UTC()

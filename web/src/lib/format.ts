@@ -14,6 +14,17 @@ export function fmtClock(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+// fmtRise renders a utilization rise (0-1) as "+3%", or "—" for none.
+export function fmtRise(r: number): string {
+  return r > 0 ? `+${Math.round(r * 100)}%` : "—";
+}
+
+// fmtDuration renders seconds to the minute: "45m", "1h10m".
+export function fmtDuration(seconds: number): string {
+  const m = Math.round(seconds / 60);
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
 export function fmtReset(iso?: string): string {
   if (!iso) return "";
   const d = new Date(iso);

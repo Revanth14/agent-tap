@@ -1,8 +1,10 @@
 import { useCallback, useMemo, useState } from "react";
 import { AgentDagView } from "./components/AgentDagView";
 import { PayloadInspector } from "./components/PayloadInspector";
+import { PlanView } from "./components/PlanView";
 import { TokenWaterfall } from "./components/TokenWaterfall";
 import { TopHudBar } from "./components/TopHudBar";
+import { usePlan } from "./hooks/usePlan";
 import { useTelemetrySocket } from "./hooks/useTelemetrySocket";
 import { sessionView, sessionsByRecency } from "./lib/state";
 
@@ -10,6 +12,11 @@ type Selection = { kind: "agent" | "span"; id: string } | null;
 
 export default function App() {
   const { state, connection } = useTelemetrySocket();
+  const plan = usePlan(state.planUsage);
+  // The plan window is the landing view once there is plan usage to show
+  // (never in the demo); a session opens from its table.
+  const [screen, setScreen] = useState<"plan" | "session">("plan");
+  const hasPlan = plan?.window !== "";
   const sessions = useMemo(() => sessionsByRecency(state), [state]);
   const [picked, setPicked] = useState<string | null>(null);
   // Follow the most recently active session until the user picks one.
@@ -29,9 +36,24 @@ export default function App() {
   const agent = view?.agents.find((a) => a.id === agentId);
   const spanTools = useMemo(() => view?.tools.filter((t) => t.span_id === span?.id) ?? [], [view, span?.id]);
 
+  if (screen === "plan" && hasPlan) {
+    return (
+      <PlanView
+        plan={plan}
+        connection={connection}
+        onOpenSession={(id) => {
+          setPicked(id);
+          setSelection(null);
+          setScreen("session");
+        }}
+      />
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
       <TopHudBar
+        onBack={hasPlan ? () => setScreen("plan") : undefined}
         sessions={sessions}
         view={view}
         onSelect={(id) => {

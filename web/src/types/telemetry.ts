@@ -97,6 +97,33 @@ export interface PlanUsage {
   observed_at: string;
 }
 
+// GET /api/plan: the current plan window of the first plan window (internal/telemetry/plan.go).
+export interface PlanView {
+  window: string; // "" before any plan usage
+  utilization: number;
+  starts_at?: string;
+  resets_at?: string;
+  rate_per_hour: number | null;
+  time_to_limit_seconds: number | null;
+  others: UsageWindow[];
+  unseen: number; // Rise atap could not attribute
+  sessions: PlanSession[];
+}
+
+export interface PlanSession {
+  id: string;
+  session: Session | null; // null once the session has left the daemon's memory
+  attributed: number;
+  shared: number;
+  shared_with: string[];
+  spans: number;
+  input_tokens_uncached: number;
+  input_tokens_cache_write: number;
+  input_tokens_cache_read: number;
+  output_tokens: number;
+  last_active?: string;
+}
+
 export interface StateSnapshot {
   sessions: Session[];
   agents: AgentNode[];

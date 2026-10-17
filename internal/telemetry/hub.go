@@ -50,12 +50,13 @@ func NewHub(store *Store) *Hub {
 	return &Hub{store: store, clients: make(map[*wsClient]struct{})}
 }
 
-// Register mounts GET /api/state, GET /api/statusline, GET /api/alerts and
-// GET /api/ws on mux.
+// Register mounts GET /api/state, GET /api/statusline, GET /api/alerts,
+// GET /api/plan and GET /api/ws on mux.
 func (h *Hub) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/state", h.serveState)
 	mux.HandleFunc("GET /api/statusline", h.serveStatusLine)
 	mux.HandleFunc("GET /api/alerts", h.serveAlerts)
+	mux.HandleFunc("GET /api/plan", h.servePlan)
 	mux.HandleFunc("GET /api/ws", h.serveWS)
 }
 
@@ -81,6 +82,15 @@ func (h *Hub) serveAlerts(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	if err := json.NewEncoder(w).Encode(h.store.Alerts(time.Now())); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// servePlan writes the current plan window's view as JSON.
+func (h *Hub) servePlan(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(h.store.Plan(time.Now())); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }

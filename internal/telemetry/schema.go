@@ -109,6 +109,9 @@ type UsageWindow struct {
 	Utilization float64    `json:"utilization"` // 0-1, normalized from the provider's unit
 	ResetsAt    *time.Time `json:"resets_at,omitempty"`
 	Status      string     `json:"status"` // Provider status string, passed through
+	// Length is the window's span, so its start is ResetsAt - Length; 0 when
+	// the provider does not say.
+	Length time.Duration `json:"-"`
 }
 
 // PlanUsage is account-level: every session draws on the same windows.

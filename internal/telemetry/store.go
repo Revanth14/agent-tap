@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -390,7 +389,7 @@ func (s *Store) RecordPlanUsage(u PlanUsage, sessionID, spanID string) (PlanUsag
 			if newWindow {
 				prev = 0
 			}
-			obs.Rise = math.Round((w.Utilization-prev)*1e4) / 1e4 // Drop float noise: 0.46-0.45 is 0.010000000000000009
+			obs.Rise = round4(w.Utilization - prev) // Drop float noise: 0.46-0.45 is 0.010000000000000009
 		}
 		obs.Bucket, obs.Sessions = attribute(s.allSpans(), obs.Since, at)
 		if err := s.persist(`INSERT INTO usage_observations (data, plan_window, started_at) VALUES (?, ?, ?)`,
@@ -437,6 +436,29 @@ func (s *Store) StatusLine(sessionID string, now time.Time) string {
 		sess = ls.session
 	}
 	return statusLine(burns, sess, now)
+}
+
+// Plan is the view of the latest plan usage's first window (see planView).
+// Before any plan usage it is empty.
+func (s *Store) Plan(now time.Time) PlanView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.planUsage == nil || len(s.planUsage.Windows) == 0 {
+		return PlanView{Others: []UsageWindow{}, Sessions: []PlanSession{}}
+	}
+	w := s.planUsage.Windows[0]
+	var history []UsageObservation
+	if st := s.usage[w.Name]; st != nil {
+		history = st.history
+	}
+	sessions := map[string]*Session{}
+	for id, ls := range s.live {
+		if ls.session != nil {
+			sess := *ls.session
+			sessions[id] = &sess
+		}
+	}
+	return planView(w, s.planUsage.Windows[1:], history, s.allSpans(), sessions, now)
 }
 
 // Alerts lists the thresholds the latest plan usage has crossed (see alerts).

@@ -1,4 +1,4 @@
-import { Activity, Code2, Gauge, Layers, Terminal, Users } from "lucide-react";
+import { Activity, ArrowLeft, Code2, Gauge, Layers, Terminal, Users } from "lucide-react";
 import type { ReactNode } from "react";
 import type { Connection } from "../hooks/useTelemetrySocket";
 import { fmtPct, fmtReset, fmtTokens } from "../lib/format";
@@ -8,6 +8,7 @@ import type { PlanUsage, Session, SurfaceType } from "../types/telemetry";
 const COMPACT_WARN = 0.75; // Warn at 75% of the window, so it scales between 200K and 1M.
 
 interface Props {
+  onBack?: () => void; // Absent while there is no plan usage to go back to
   sessions: Session[];
   view: SessionView | null;
   onSelect: (id: string) => void;
@@ -15,7 +16,7 @@ interface Props {
   planUsage: PlanUsage | null;
 }
 
-export function TopHudBar({ sessions, view, onSelect, connection, planUsage }: Props) {
+export function TopHudBar({ onBack, sessions, view, onSelect, connection, planUsage }: Props) {
   const s = view?.session;
   const input = s ? s.total_input_tokens + s.total_cache_write + s.total_cache_read : 0;
   const lastSpan = view?.spans.at(-1);
@@ -29,6 +30,12 @@ export function TopHudBar({ sessions, view, onSelect, connection, planUsage }: P
     <header className="flex flex-wrap items-stretch gap-3 border-b border-line bg-panel px-4 py-3">
       <div className="flex min-w-64 flex-col justify-center gap-1.5">
         <div className="flex items-center gap-2">
+          {onBack && (
+            <button type="button" onClick={onBack} className="flex items-center gap-1 rounded px-1 text-xs text-gray-400 hover:bg-canvas hover:text-gray-200">
+              <ArrowLeft className="size-3.5" aria-hidden />
+              Plan
+            </button>
+          )}
           <Activity className="size-4 text-cli" aria-hidden />
           <span className="font-semibold tracking-tight">agent-tap</span>
           <ConnectionPill connection={connection} />
@@ -120,7 +127,7 @@ function Card({ icon, title, children }: { icon: ReactNode; title: string; child
   );
 }
 
-function ConnectionPill({ connection }: { connection: Connection }) {
+export function ConnectionPill({ connection }: { connection: Connection }) {
   const style = {
     live: "border-cli/40 text-cli",
     connecting: "border-gray-600 text-gray-400",
@@ -151,6 +158,6 @@ export function surfaceName(s: SurfaceType): string {
   return s === "vscode_ext" ? "VS Code" : s === "terminal_cli" ? "CLI" : "?";
 }
 
-function basename(path: string): string {
+export function basename(path: string): string {
   return path.split("/").filter(Boolean).at(-1) ?? "";
 }
