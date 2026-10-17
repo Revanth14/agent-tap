@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -23,11 +24,15 @@ import (
 	"github.com/Revanth14/agent-tap/internal/telemetry"
 )
 
+// version is set at build time by the Makefile from git describe.
+var version = "dev"
+
 const usage = `usage:
   atap start  [--port N] [--log-wire] [--demo]   run the daemon
   atap init   [--port N]   install the LaunchAgent, then route Claude Code through it
   atap uninit [--port N]   undo init: settings first, then the LaunchAgent
-  atap status [--port N]   show wiring, daemon health and what it has seen`
+  atap status [--port N]   show wiring, daemon health and what it has seen
+  atap version             print the version`
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -45,6 +50,9 @@ func run(args []string) error {
 		return start(args[1:])
 	case "init", "uninit", "status":
 		return manage(args[0], args[1:])
+	case "version", "--version":
+		fmt.Println("atap", version)
+		return nil
 	}
 	return errors.New(usage)
 }
@@ -87,6 +95,11 @@ func start(args []string) error {
 			return nil
 		}
 		return err
+	}
+	if *demoMode {
+		// Keep simulated sessions out of the real history, so trying the
+		// demo before atap init leaves nothing behind in the dashboard.
+		cfg.DBPath = filepath.Join(filepath.Dir(cfg.DBPath), "demo.db")
 	}
 
 	store, err := telemetry.OpenStore(cfg.DBPath, 0)
